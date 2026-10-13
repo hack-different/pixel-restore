@@ -16,6 +16,9 @@ use std::time::Instant;
 
 pub const IMAGES_PAGE: &str = "https://developers.google.com/android/images";
 const LINK_PREFIX: &str = "https://dl.google.com/dl/android/aosp/";
+/// The cookie the page's "Acknowledge" button sets. Without it the page is
+/// served with the terms wall only and no image links.
+const TOS_ACK_COOKIE: &str = "devsite_wall_acks=nexus-image-tos";
 
 /// Tensor-era Pixel codenames, so `--device "pixel 9 pro xl"` works too.
 pub const DEVICES: &[(&str, &str)] = &[
@@ -55,6 +58,14 @@ pub fn codename(input: &str) -> Result<String> {
     }
     if let Some((c, _)) = DEVICES.iter().find(|(_, n)| norm(n) == want) {
         return Ok(c.to_string());
+    }
+    // Pre-Tensor Pixels still have factory images, and naming one should get
+    // `boot` to say why it can't help rather than "unknown device".
+    if let Some(m) = crate::devices::QUALCOMM_MODELS
+        .iter()
+        .find(|m| m.codename == want || norm(m.name) == want)
+    {
+        return Ok(m.codename.to_string());
     }
     if input.chars().all(|c| c.is_ascii_alphanumeric()) && !input.is_empty() {
         // An unlisted codename; let the page decide whether it exists.
@@ -205,7 +216,7 @@ pub fn pick_latest<'a>(images: &'a [Image], build: Option<&str>) -> Option<&'a I
         .map(|(_, i)| i)
 }
 
-fn agent() -> ureq::Agent {
+pub(crate) fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)
         .user_agent(concat!("pixel-restore/", env!("CARGO_PKG_VERSION")))
@@ -218,6 +229,7 @@ pub fn list_images(device: &str) -> Result<Vec<Image>> {
     eprintln!("reading {IMAGES_PAGE} ...");
     let mut resp = agent()
         .get(IMAGES_PAGE)
+        .header("Cookie", TOS_ACK_COOKIE)
         .call()
         .context("fetching the factory image listing")?;
     ensure!(

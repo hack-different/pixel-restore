@@ -23,16 +23,21 @@ import tty
 import zlib
 
 HEADER = 4096
-# Pixel 8 style sequence (the Pixel 9 ROM is assumed to match). Each tuple is
-# (request name, partition, "full" | "header" | "body").
+# The order a Pixel 8 Pro ROM (zuma) asked for stages on real hardware; the
+# Pixel 9 ROM is assumed to match. Each tuple is (request name, partition,
+# "full" | "header" | "body"). After BL2B the real phone re-enumerates and
+# BL2 carries on asking from GSA1; --handoff-gap imitates that pause.
 SCRIPT = [
     ("BL1", "bl1", "full"),
     ("DPM", "dpm", "full"),
+    ("GCF", "gcf", "header"),
+    ("GCFB", "gcf", "body"),
     ("EPBL", "pbl", "header"),
     ("EPBB", "pbl", "body"),
     ("BL2", "bl2", "header"),
     ("BL2B", "bl2", "body"),
-    ("GSA1", "gsa", "full"),
+    ("GSA1", "gsa_bl1", "full"),
+    ("GSAF", "gsa", "full"),
     ("ABL", "abl", "header"),
     ("ABLB", "abl", "body"),
     ("TZSW", "tzsw", "header"),
@@ -64,18 +69,34 @@ def parse_fbpk(data):
     return parts
 
 
+# Header tag (ASCII in the magic word at 0x400) -> the partition it answers.
+TAGS = {"APBL": "bl1", "GCF": "gcf", "EPBL": "pbl", "BL2": "bl2", "GSA1": "gsa_bl1",
+        "GSAF": "gsa", "ABL": "abl", "TZSW": "tzsw", "LDFW": "ldfw", "BL31": "bl31"}
+
+
+def load_dir(path):
+    """A loose recovery pack (tensor-usbdl sources/<pack>/), keyed by header tag."""
+    parts = {}
+    for name in os.listdir(path):
+        if not name.endswith(".img"):
+            continue
+        data = open(os.path.join(path, name), "rb").read()
+        tag = data[0x400:0x404].rstrip(b"\0").decode("ascii", "replace")
+        parts[TAGS.get(tag, name[:-4])] = data
+    return parts
+
+
 def expected_len(parts, partition, part):
-    if partition == "gsa" and "gsa" not in parts and "gsa_bl1" in parts:
-        partition = "gsa_bl1"
     if partition not in parts:
         return HEADER if partition == "dpm" else None
     n = len(parts[partition])
     return {"full": n, "header": HEADER, "body": n - HEADER}[part]
 
 
-def read_exact(fd, n, timeout=30):
+def read_exact(fd, n, timeout=None):
     buf = bytearray()
-    deadline = time.time() + timeout
+    # macOS ptys move only a few hundred KB/s; allow for the 8 MB TZSW body.
+    deadline = time.time() + (timeout or 30 + n / 50_000)
     while len(buf) < n:
         if time.time() > deadline:
             raise TimeoutError(f"wanted {n} bytes, got {len(buf)}")
@@ -89,6 +110,22 @@ def read_exact(fd, n, timeout=30):
             continue
         buf += chunk
     return bytes(buf)
+
+
+def wait_readable(fd, timeout):
+    """True once the host has sent something (without consuming it)."""
+    import select
+    r, _, _ = select.select([fd], [], [], timeout)
+    return bool(r)
+
+
+def drain(fd):
+    while True:
+        try:
+            if not os.read(fd, 65536):
+                return
+        except BlockingIOError:
+            return
 
 
 def wait_for_host(fd, timeout=60):
@@ -107,15 +144,19 @@ def wait_for_host(fd, timeout=60):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--image", required=True, help="bootloader.img to validate against")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--image", help="bootloader.img to validate against")
+    src.add_argument("--dir", help="recovery pack directory to validate against")
     ap.add_argument("--serial", default="09875001deadbeef0123")
     ap.add_argument("--fail-at", help="pretend this stage's header fails")
     ap.add_argument("--only", type=int, help="stop after N stages")
-    ap.add_argument("--pause-after", help="go silent after ACKing this stage, like BL2 re-enumerating")
-    ap.add_argument("--pause", type=float, default=3.0, help="seconds of silence for --pause-after")
+    ap.add_argument("--handoff-gap", type=float, default=0,
+                    help="go silent this many seconds after BL2B, like the real re-enumeration")
+    ap.add_argument("--pause-after", help="stage to go silent after (with --pause; default BL2B)")
+    ap.add_argument("--pause", type=float, help="seconds of silence after --pause-after")
     args = ap.parse_args()
 
-    parts = parse_fbpk(open(args.image, "rb").read())
+    parts = load_dir(args.dir) if args.dir else parse_fbpk(open(args.image, "rb").read())
     master, slave = pty.openpty()
     tty.setraw(slave)  # no echo, no line discipline: behave like a USB CDC port
     os.set_blocking(master, False)
@@ -133,9 +174,17 @@ def main():
         if want is None:
             print(f"[rom] {stage}: image has no {partition}, skipping", file=sys.stderr)
             continue
-        say(f"eub:req:{args.serial}:{stage}")
-        time.sleep(0.05)
-        os.write(master, b"C")  # bare, no terminator, like the real ROM
+        # Like the real ROM: repeat the request and a bare `C` (no
+        # terminator) until the host starts an upload.
+        deadline = time.time() + 30
+        while True:
+            say(f"eub:req:{args.serial}:{stage}")
+            os.write(master, b"C")
+            if wait_readable(master, 0.8):
+                break
+            if time.time() > deadline:
+                print(f"[rom] {stage}: host never uploaded", file=sys.stderr)
+                sys.exit(6)
         hdr = read_exact(master, 8)
         if hdr[:4] != b"\x1bDNW":
             print(f"[rom] bad opcode {hdr[:4]!r} for {stage}", file=sys.stderr)
@@ -146,8 +195,6 @@ def main():
         if len(payload) != want:
             print(f"[rom] {stage}: got {len(payload)} bytes, expected {want}", file=sys.stderr)
             sys.exit(3)
-        if partition == "gsa" and "gsa" not in parts:
-            partition = "gsa_bl1"
         if partition in parts:
             src = parts[partition]
             ref = {"full": src, "header": src[:HEADER], "body": src[HEADER:]}[part]
@@ -161,10 +208,11 @@ def main():
             time.sleep(0.5)
             sys.exit(5)
         say(f"eub:ack:{args.serial}:{stage}")
-        if args.pause_after == stage:
-            print(f"[rom] silent for {args.pause}s after {stage} (re-enumeration)", file=sys.stderr)
-            time.sleep(args.pause)
-            wait_for_host(master)  # the host reconnects and pokes us again
+        gap = args.pause if args.pause is not None else args.handoff_gap
+        if stage == (args.pause_after or "BL2B") and gap:
+            print(f"[rom] silent for {gap}s after {stage} (re-enumeration)", file=sys.stderr)
+            time.sleep(gap)
+            drain(master)
     print(f"[rom] handing off to ABL after {sent} stages", file=sys.stderr)
     time.sleep(0.3)
     os.close(master)

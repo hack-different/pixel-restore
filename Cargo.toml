@@ -16,7 +16,9 @@ crc32fast = "1"
 flate2 = "1"
 serialport = { version = "4", default-features = false }
 sha2 = "0.10"
-ureq = "3"
+# No gzip: dl.google.com gzips the factory ZIP on request, which hides its
+# real length and breaks byte ranges.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [features]

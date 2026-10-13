@@ -34,23 +34,6 @@ pub enum Generation {
     Split,
 }
 
-/// Guess the generation from the serial the ROM reports in
-/// `exynos_usb_booting`. Known prefixes (characters 1..5) are 9845 = Pixel 6,
-/// 9855 = Pixel 7, 9865 = Pixel 8. Anything newer or unknown is assumed to
-/// behave like Pixel 8, since that is the more recent design.
-pub fn guess_generation(serial: &str) -> (Generation, &'static str) {
-    let prefix = serial.get(1..5).unwrap_or("");
-    match prefix {
-        "9845" => (Generation::Legacy, "Pixel 6 series (gs101)"),
-        "9855" => (Generation::Legacy, "Pixel 7 series (gs201)"),
-        "9865" => (Generation::Split, "Pixel 8 series (zuma)"),
-        _ => (
-            Generation::Split,
-            "unknown series, assuming Pixel 8+ behaviour",
-        ),
-    }
-}
-
 /// Resolve a ROM request to (partition name, part of the image).
 pub fn resolve(stage: &str, generation: Generation) -> Option<(&'static str, Part)> {
     use Part::*;
@@ -165,33 +148,40 @@ impl Sources {
         self.partition_bytes(partition)
     }
 
-    /// Every image we hold, with where it came from.
-    fn all_images(&self) -> Vec<(String, &[u8])> {
-        let mut out: Vec<(String, &[u8])> = self
+    /// Images whose header magic names `tag`: loose files (recovery packs,
+    /// --dir, --stage) first, then the FBPK.
+    fn tagged(&self, tag: &str) -> [Vec<(String, &[u8])>; 2] {
+        let hit = |b: &[u8]| header_tag(b).as_deref() == Some(tag);
+        let files = self
             .files
             .iter()
+            .filter(|(_, b)| hit(b))
             .map(|(n, b)| (format!("{n}.img"), b.as_slice()))
             .collect();
-        if let Some(pack) = &self.pack {
-            out.extend(
-                pack.data_entries()
-                    .map(|e| (e.name.clone(), pack.entry_data(e))),
-            );
-        }
-        out
+        let pack = self
+            .pack
+            .iter()
+            .flat_map(|p| {
+                p.data_entries()
+                    .map(move |e| (e.name.clone(), p.entry_data(e)))
+            })
+            .filter(|(_, b)| hit(b))
+            .collect();
+        [files, pack]
     }
 
     /// The one image whose header magic names `tag`, if exactly one does.
+    /// Loose files are searched before the FBPK, so a recovery pack layered
+    /// over a factory image wins stage by stage.
     fn by_tag(&self, tag: &str) -> Option<(String, &[u8])> {
-        let mut hits = self
-            .all_images()
-            .into_iter()
-            .filter(|(_, b)| header_tag(b).as_deref() == Some(tag));
-        let first = hits.next()?;
-        if hits.next().is_some() {
-            return None; // ambiguous; let the name lookup decide
+        for mut hits in self.tagged(tag) {
+            match hits.len() {
+                0 => continue,
+                1 => return hits.pop(),
+                _ => return None, // ambiguous; let the name lookup decide
+            }
         }
-        Some(first)
+        None
     }
 
     fn partition_bytes(&self, partition: &str) -> Option<&[u8]> {
@@ -414,13 +404,5 @@ mod tests {
         );
         assert_eq!(header_tag(&tagged(b"BL2\0", 0, 1)).as_deref(), Some("BL2"));
         assert_eq!(header_tag(&[0xffu8; HEADER_LEN]), None);
-    }
-
-    #[test]
-    fn generation_guess() {
-        assert_eq!(guess_generation("09855001abcd").0, Generation::Legacy);
-        assert_eq!(guess_generation("09865001abcd").0, Generation::Split);
-        assert_eq!(guess_generation("09875001abcd").0, Generation::Split);
-        assert_eq!(guess_generation("").0, Generation::Split);
     }
 }

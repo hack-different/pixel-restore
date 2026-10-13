@@ -31,50 +31,96 @@ On Linux, ModemManager may grab the port when it appears; stop it or add a
 udev ignore rule for `18d1:4f00`. Build with `--features libudev` if you have
 `libudev-dev` and want udev-based port enumeration.
 
+## Supported models
+
+The ROM only accepts a BL1 whose signed header has the "USB bootable" bit set
+(see Status). Google's factory images are signed without it, so what decides
+whether a model can be rescued is whether such a BL1 exists for its SoC. The
+only public ones are in the recovery packs of the
+[tensor-usbdl](https://github.com/JoshuaDoes/tensor-usbdl) v0.2.0 release,
+which this tool downloads once (SHA-256 pinned), caches, and serves; nothing
+in that ZIP is executed. `pixel-restore models` prints this table.
+
+| Model | Codename | SoC | Status |
+| --- | --- | --- | --- |
+| Pixel 8 | shiba | zuma (G3) | **verified** on a July 2024 bootloader (ripcurrent-14.5) |
+| Pixel 8 Pro | husky | zuma (G3) | **verified** before the anti-rollback bump; refused once on ripcurrent-17.0 |
+| Pixel 7, 7 Pro | panther, cheetah | gs201 (G2) | recovery pack (`cloudripper` ABL) |
+| Pixel 8a | akita | zuma (G3) | husky pack, untested: BL1 key matches, ABL is husky's |
+| Pixel 7a, Fold, Tablet | lynx, felix, tangorpro | gs201 (G2) | gs201 pack, untested: ABL is panther/cheetah's |
+| Pixel 6, 6 Pro, 6a | oriole, raven, bluejay | gs101 (G1) | no USB-bootable BL1 published |
+| Pixel 9 family, 9a | tokay, caiman, komodo, comet, tegu | zumapro (G4) | no USB-bootable BL1 published |
+| Pixel 10 family | frankel, blazer, mustang, rango | laguna (G5) | no USB-bootable BL1 published; ROM protocol unknown |
+
+**Anti-rollback is the catch.** The packs' BL1s date from 2023. Once a phone
+has run a bootloader that raised its BL1 anti-rollback level, its ROM
+refuses them (`bl1 header fail`) and nothing public can boot it over USB.
+Observed: a Pixel 8 Pro accepted the husky pack, was reflashed with the
+Sep 2026 factory image (ripcurrent-17.0), and now refuses it; a Pixel 8 on
+ripcurrent-14.5 (Jul 2024) accepts the shiba pack. Which build first bumped
+the level is not known. Updating a rescued phone to the current factory
+image closes the door behind it.
+
+"Untested" rows are worth trying: every upload lands in RAM, so a stage the
+phone rejects costs nothing. If the sibling's ABL does not run, layer the
+model's own factory image under the pack with `--image` and override stages
+with `--stage`. For the "no BL1" rows the tool still tries the retail image,
+and the ROM will answer `bl1 header fail`.
+
 ## Use
 
-1. Get the **newest factory image for the exact model**. Either download it
-   from <https://developers.google.com/android/images>, or let the tool do it:
-
-   ```sh
-   pixel-restore fetch komodo            # newest Pixel 9 Pro XL bootloader-*.img, a few MB
-   pixel-restore fetch komodo --full     # the whole 4 GB factory ZIP, SHA-256 checked, resumable
-   pixel-restore fetch komodo --list     # every build Google lists for the device
-   pixel-restore fetch "Pixel 9 Pro XL"  # model names work too
-   ```
-
-   The default pulls only `bootloader-*.img` out of the ZIP with HTTP range
-   requests, which is all `boot` needs; `--full` gets you the image for
-   flash-all afterwards. Fetching accepts Google's factory-image terms, the
-   same as clicking Acknowledge on the page. `--url <zip url>` skips the
-   listing page. "bl1 header fail" or a NAK from the ROM almost always means
-   the wrong model's image, or one older than the anti-rollback level the
-   phone already has.
-2. Unplug the phone. Hold **Power + Volume Up + Volume Down**, plug in USB and
+1. Unplug the phone. Hold **Power + Volume Up + Volume Down**, plug in USB and
    keep holding for about 15 seconds. `pixel-restore detect` should print the
    serial port.
-3. Run the boot:
+2. Boot it:
 
    ```sh
-   pixel-restore boot --image komodo-xxxx-factory-xxxx.zip --wait
+   pixel-restore boot --device husky --wait      # or "Pixel 8 Pro"
+   pixel-restore boot --wait                     # let the ROM's chip id pick the pack
    ```
 
-   `--image` takes either the factory ZIP or the `bootloader-*.img` from
-   inside it; `--device komodo` fetches the newest bootloader instead.
-   `--wait` keeps scanning until the phone appears, so you can start the
-   tool first and then do the button dance.
-4. When the ROM stops asking for stages the phone is booting ABL. Make it
-   permanent from the factory image folder:
+   `--device` picks the recovery pack and makes the tool refuse to send
+   anything if the ROM reports a different SoC (a Pixel 9 image offered to a
+   Pixel 8, say). Without it the ROM's chip id decides, which works when one
+   pack covers the SoC (gs201); for zuma it asks which model. `--wait` keeps
+   scanning until the phone appears, so you can start the tool first.
+
+   `--pack auto` (the default) adds the pack when you name `--device` or give
+   no other source; with `--image`, `--dir` or `--stage` and no `--device`
+   it serves exactly what you gave.
+
+   Midway, after BL2, the phone re-enumerates and BL2 carries on asking for
+   GSA, ABL, TZSW, LDFW and BL31 on the new connection; the tool follows it
+   (`--reconnect-wait`, default 10 s) and finishes when the phone leaves ROM
+   mode, then checks `fastboot devices`.
+3. The bootloader now running lives in RAM only. Make it permanent from the
+   factory image:
 
    ```sh
-   fastboot devices
-   fastboot getvar battery-voltage       # want > 4200 mV before flashing
+   pixel-restore fetch husky --full              # whole factory ZIP, SHA-256 checked
+   unzip husky-*-factory-*.zip && cd husky-*/
+   fastboot getvar battery-voltage               # want > 4200 mV before flashing
    fastboot flash bootloader bootloader-*.img
    fastboot reboot-bootloader
-   ./flash-all.sh
+   ./flash-all.sh                                # wipes data; drop -w to keep it
    ```
 
-Pushing stages over USB only boots the phone once; step 4 is what fixes it.
+   Don't reboot or let the battery die before the bootloader flash: the phone
+   goes straight back to ROM recovery.
+
+### Factory images
+
+```sh
+pixel-restore fetch komodo            # newest Pixel 9 Pro XL bootloader-*.img, a few MB
+pixel-restore fetch komodo --full     # the whole 4 GB factory ZIP, SHA-256 checked, resumable
+pixel-restore fetch komodo --list     # every build Google lists for the device
+pixel-restore fetch "Pixel 9 Pro XL"  # model names work too
+```
+
+The default pulls only `bootloader-*.img` out of the ZIP with HTTP range
+requests; `--full` gets you the image for flash-all. Fetching accepts
+Google's factory-image terms, the same as clicking Acknowledge on the page.
+`--url <zip url>` skips the listing page.
 
 ### Other commands
 
@@ -82,8 +128,11 @@ Pushing stages over USB only boots the phone once; step 4 is what fixes it.
 pixel-restore detect --all                  # list every serial port if the phone isn't found
 pixel-restore unpack bootloader-*.img       # show the partitions, verify CRCs
 pixel-restore unpack factory.zip -o out/    # extract them as out/<name>.img
-pixel-restore boot --image X --verbose      # print every line the ROM sends
-pixel-restore boot --dir tensor-usbdl-v0.2.0/sources/zuma/husky   # serve a recovery pack
+pixel-restore models                        # SoC and support status of every Tensor Pixel
+pixel-restore boot --device X --verbose     # print every line the ROM sends
+pixel-restore boot --pack tensor-usbdl-v0.2.0.zip --device husky   # use a local release copy
+pixel-restore boot --pack sources/zuma/husky                      # or one pack directory
+pixel-restore boot --image factory.zip --pack none                # retail only (expect bl1 header fail)
 pixel-restore boot --image X --stage dpm=my-dpm.img   # override one partition
 pixel-restore boot --image X --map NEWSTAGE=gsa       # teach it an unfamiliar request
 ```
@@ -111,9 +160,16 @@ a code body. Some requests want the whole image (`BL1`, `DPM`, `GSA1`), others
 want the header and the body separately (`ABL` then `ABLB`, `BL2` then
 `BL2B`, ...). The one known generational difference is `EPBL`: Pixel 6/7 want
 the whole PBL, Pixel 8 and later want the header and then ask for `EPBB`.
-The tool guesses from the serial the ROM reports (`9845` Pixel 6, `9855`
-Pixel 7, `9865` Pixel 8; anything newer is treated like Pixel 8) and
-`--epbl full|split` overrides the guess.
+The tool reads the SoC from the serial the ROM reports (`9845` gs101, `9855`
+gs201, `9865` zuma; `9875` is assumed for zumapro, and anything unknown is
+treated like zuma) and `--epbl full|split` overrides the guess.
+
+Observed on a Pixel 8 Pro: `BL1 DPM GCF GCFB EPBL EPBB BL2 BL2B` from the
+ROM, then a USB re-enumeration, then `GSA1 GSAF ABL ABLB TZSW TZSB LDFW LDFB
+BL31 BL3B` from BL2, then fastboot. While waiting, the ROM repeats its
+request and a bare `C` about every 0.8 s and resets USB after a few seconds
+without an upload. The tool only sends its newline nudge to a connection
+that has said nothing for 1.5 s, so it can't land inside an upload.
 
 If no `dpm` partition exists, 4096 zero bytes are sent, which is what
 tensor-usbdl does and what Pixel 7/8 ROMs accept.
@@ -131,12 +187,13 @@ booting ABL, which is the end of the sequence.
 * Protocol and container parsing are unit tested, and the full boot loop is
   exercised end to end against `tools/fake_rom.py`, which plays a Pixel 8
   style ROM on a pseudo-terminal and byte-checks every upload.
-* **Verified on a Pixel 8 Pro** (husky), which went from ROM Recovery to
-  fastboot with the tensor-usbdl husky pack and was then reflashed normally.
-  The stage table comes from that run plus Pixel 7/8 observations; a Pixel 9
-  (zumapro) ROM is assumed to behave like Pixel 8. Run with `--verbose` on
-  first use. If it asks for a stage the tool does not know, the error names
-  it and `--map` lets you serve it without a rebuild.
+* **Verified on hardware** with the tensor-usbdl recovery packs: a Pixel 8
+  Pro (husky) went from ROM Recovery to fastboot and was reflashed normally,
+  and a Pixel 8 (shiba) on a July 2024 bootloader took the whole shiba pack
+  in one connection and was reflashed from the RAM-booted fastboot. Other
+  models: see Supported models. Run with `--verbose` on first use. If the
+  ROM asks for a stage the tool does not know, the error names it and
+  `--map` lets you serve it without a rebuild.
 * **Retail bootloaders are refused.** Confirmed on a Pixel 8 Pro: the ROM
   ACKs the factory image's BL1 and then answers `bl1 header fail`, for both
   the current stable and the newest beta. The ROM only accepts a BL1 whose
@@ -144,7 +201,8 @@ booting ABL, which is the end of the sequence.
   0x410) set, and retail images are signed without it. Google publishes no
   such images; the community's tensor-usbdl release carries recovery packs
   (`sources/gs201`, `sources/zuma/shiba`, `sources/zuma/husky`) whose images
-  all have flags `0x211`. Serve one with `boot --dir <pack dir>`. Their BL1s
+  all have the bit set (`0x211` on zuma, `0x401` on gs201); `boot` serves
+  them by default. Their BL1s
   date from 2023, so a phone that took Google's May 2025 anti-rollback bump
   for Pixel 6/8 may refuse them too; there is no public answer for that case.
   `unpack` prints each image's header tag and flags word, and `boot` warns
@@ -164,14 +222,18 @@ booting ABL, which is the end of the sequence.
 
 ```sh
 python3 tools/fake_rom.py --image bootloader.img     # prints /dev/pts/N (Linux) or /dev/ttysNNN (macOS)
-pixel-restore boot --image bootloader.img --port /dev/pts/N --verbose
+pixel-restore boot --image bootloader.img --pack none --port /dev/pts/N --verbose
+
+python3 tools/fake_rom.py --dir sources/zuma/husky --serial 09865001deadbeef --handoff-gap 5
+pixel-restore boot --device husky --port /dev/ttysNNN --reconnect-wait 3
 ```
 
-`fake_rom.py --pause-after BL2B --pause 3` goes quiet for a few seconds after
-that stage, the way the real phone does while BL2 re-enumerates, to exercise
-the reconnect path (`boot --idle-timeout 1 --reconnect-wait 5` keeps the
-test quick).
-
+The fake ROM replays the request order captured from a Pixel 8 Pro,
+repeats each request until served, byte-checks every upload against the
+image or pack, and with `--handoff-gap` (or `--pause-after BL2B --pause 3`)
+goes silent after BL2B the way the real phone does when BL2 takes over. On
+macOS the `serialport` crate cannot configure a pty, so the tool opens one
+as a plain non-blocking file.
 ### Brick-and-recover test on a real phone
 
 `tools/brick_test.sh` proves the whole loop on hardware: it flashes a
@@ -199,12 +261,18 @@ partition:
 * **`bl1` reproduces ROM Recovery itself**, the state this tool exists for,
   but it is the one-way door. The ROM only accepts a BL1 with the USB-boot
   bit, the only such BL1s are the community pack's 2023 ones, and a ROM that
-  has taken an anti-rollback bump refuses them. The husky pack was accepted
-  by this phone before it was reflashed with the current factory image; it is
-  not known whether that image bumped the BL1 level. If it did, a corrupted
-  BL1 cannot be recovered by anyone. Only do this on a phone you can afford
-  to lose, or after confirming the pack still boots the phone from a state
-  that does not depend on it.
+  has taken an anti-rollback bump refuses them. **This is confirmed:** the
+  Pixel 8 Pro that the husky pack rescued was then reflashed with the
+  current factory image (ripcurrent-17.0), and a forced ROM-mode test now
+  gets `bl1 header fail` on the same pack BL1. On that phone any brick that
+  lands back at the ROM is permanent. Before any brick test, force ROM mode
+  (button combo, nothing flashed) and confirm `pixel-restore boot` gets past
+  BL1; a Pixel 8 still on ripcurrent-14.5 (July 2024) does.
+* **`abl` is only low-risk if the BL1 check above passes.** If BL2 drops the
+  phone back to the ROM rather than asking over USB itself, the ROM wants
+  BL1 again. Recovery also serves the pack's 2023 later stages, which a
+  newer BL2 may reject as older than its own; layer the phone's current
+  factory image with `--image` if that happens.
 * Flashing writes the current slot only. A phone that falls back to the other
   slot has not been bricked; corrupting both slots is what makes a brick
   certain, and the script deliberately does not do that for you.
@@ -213,4 +281,7 @@ partition:
 
 Protocol details come from JoshuaDoes' tensor-usbdl (AGPL-3.0; this is an
 independent reimplementation, not a port of its code). The FBPK layout follows
-Google's `fbpack.py` / `fbpacktool.py` published on source.android.com.
+Google's `fbpack.py` / `fbpacktool.py` published on source.android.com. The
+USB-bootable recovery packs are not bundled; `boot` downloads JoshuaDoes'
+tensor-usbdl v0.2.0 release from GitHub at run time and reads only its
+`sources/` images.

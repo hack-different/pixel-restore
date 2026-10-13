@@ -1,7 +1,9 @@
+mod devices;
 mod dnw;
 mod eub;
 mod fbpk;
 mod fetch;
+mod packs;
 mod remotezip;
 mod stages;
 
@@ -15,8 +17,10 @@ use std::time::Duration;
 ///
 /// When a Pixel 6 or newer cannot find a valid bootloader it enumerates over
 /// USB as a serial device named "Pixel ROM Recovery" and asks the host to
-/// feed it bootloader stages one at a time. This tool answers those requests
-/// straight from the bootloader.img inside the factory image for your model.
+/// feed it bootloader stages one at a time. The ROM only accepts a BL1 signed
+/// with the "USB bootable" bit, which retail images lack, so this tool serves
+/// the community recovery pack for your SoC (see `models`), falling back to
+/// the bootloader.img inside the factory image for anything the pack lacks.
 /// Once ABL is running the phone comes up in fastboot and you can flash the
 /// bootloader permanently with `fastboot flash bootloader ...` / flash-all.
 #[derive(Parser)]
@@ -49,6 +53,9 @@ enum Cmd {
     },
     /// Feed bootloader stages to the phone until it reaches fastboot.
     Boot(BootArgs),
+    /// List every Tensor Pixel, its SoC, and whether it can be booted from
+    /// ROM recovery with what is publicly available.
+    Models,
     /// Find the newest factory image for a device on Google's download page
     /// and fetch it. By default only bootloader-*.img is pulled out of the
     /// ZIP (a few MB via byte-range requests); --full downloads the whole
@@ -84,11 +91,20 @@ struct BootArgs {
     #[arg(long, short)]
     image: Option<PathBuf>,
 
-    /// Instead of --image, fetch the newest bootloader for this device
-    /// (codename or model name) from Google and use it. Saved next to the
-    /// tool so the next run can pass it with --image.
-    #[arg(long, conflicts_with = "image")]
+    /// The phone's model, as a codename or name (`husky`, "Pixel 8 Pro").
+    /// Picks the recovery pack, and the boot refuses to start if the ROM
+    /// reports a different SoC. Without it the ROM's chip id decides, which
+    /// is enough when one pack fits the whole SoC. See `pixel-restore models`.
+    #[arg(long)]
     device: Option<String>,
+
+    /// Where USB-bootable stages come from: `auto` (the cached tensor-usbdl
+    /// release, downloaded on first use), `none` (retail images only, which
+    /// the ROM refuses at BL1), or a path to a tensor-usbdl release ZIP, an
+    /// unpacked release, or one pack directory. Pack images win over
+    /// --image; --dir and --stage win over both.
+    #[arg(long, default_value = "auto", value_name = "auto|none|PATH")]
+    pack: String,
 
     /// Directory of loose images (bl1.img, pbl.img, abl.img ...) to use
     /// instead of, or on top of, --image.
@@ -127,14 +143,13 @@ struct BootArgs {
     #[arg(long)]
     stop: bool,
 
-    /// Treat this many seconds of silence as the end of a phase.
-    #[arg(long, default_value_t = 10)]
+    /// Abort if the ROM is silent for this many seconds before the first stage.
+    #[arg(long, default_value_t = 20)]
     idle_timeout: u64,
 
-    /// After a phase ends, wait this many seconds for the phone to show up
-    /// again as a ROM device and continue. BL2 re-enumerates USB on Pixel 8
-    /// before asking for GSA1, so the sequence spans two connections.
-    #[arg(long, default_value_t = 15)]
+    /// Seconds to wait for the phone to come back after it re-enumerates
+    /// (BL2 does this mid-boot) before deciding it has left ROM mode.
+    #[arg(long, default_value_t = 10)]
     reconnect_wait: u64,
 
     /// Print every line the ROM sends.
@@ -154,6 +169,10 @@ fn run() -> Result<()> {
         Cmd::Detect { all, wait } => detect(all, wait),
         Cmd::Unpack { image, out } => unpack(&image, out.as_deref()),
         Cmd::Boot(args) => boot(args),
+        Cmd::Models => {
+            models();
+            Ok(())
+        }
         Cmd::Fetch {
             device,
             build,
@@ -322,30 +341,6 @@ fn unpack(image: &std::path::Path, out: Option<&std::path::Path>) -> Result<()> 
     Ok(())
 }
 
-/// After a phase ends, poll for the phone to reappear as a ROM device. With a
-/// fixed --port, reappearing means that path exists again.
-fn wait_for_rom(fixed_port: Option<&str>, wait: Duration) -> Result<Option<String>> {
-    let started = std::time::Instant::now();
-    // Give the old connection a moment to go away before looking for the new one.
-    std::thread::sleep(Duration::from_millis(750));
-    while started.elapsed() < wait {
-        match fixed_port {
-            Some(p) => {
-                if std::path::Path::new(p).exists() {
-                    return Ok(Some(p.to_string()));
-                }
-            }
-            None => {
-                if let Some(d) = eub::find_devices()?.into_iter().next() {
-                    return Ok(Some(d.port));
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    Ok(None)
-}
-
 fn parse_kv(items: &[String], what: &str) -> Result<HashMap<String, String>> {
     items
         .iter()
@@ -375,23 +370,169 @@ const LOOSE_IMAGE_NAMES: &[&str] = &[
     "bl1", "pbl", "bl2", "abl", "bl31", "tzsw", "ldfw", "gsa_bl1", "gsa", "gsaf", "gcf", "dpm",
 ];
 
-fn boot(args: BootArgs) -> Result<()> {
-    if args.image.is_none() && args.device.is_none() && args.dir.is_none() && args.stage.is_empty()
-    {
-        bail!("give me the bootloader with --image <bootloader-*.img or factory.zip> or --device <codename>");
+fn models() {
+    println!(
+        "{:<10} {:<18} {:<8} {:<10} {:<11} status",
+        "codename", "model", "soc", "tensor", "pack"
+    );
+    for m in devices::MODELS {
+        println!(
+            "{:<10} {:<18} {:<8} {:<10} {:<11} {}",
+            m.codename,
+            m.name,
+            m.soc.name,
+            m.soc.tensor,
+            m.pack.unwrap_or("-"),
+            m.support.label()
+        );
     }
+    for q in devices::QUALCOMM_MODELS {
+        println!(
+            "{:<10} {:<18} {:<8} {:<10} {:<11} {}",
+            q.codename,
+            q.name,
+            q.chipset,
+            "Qualcomm",
+            "-",
+            devices::QUALCOMM_STATUS
+        );
+    }
+    println!(
+        "\nThe packs' BL1s date from 2023. A phone that has since run a bootloader \
+         which raised its BL1 anti-rollback level refuses them (\"bl1 header fail\"): \
+         a Pixel 8 Pro on ripcurrent-17.0 (Sep 2026) does, a Pixel 8 on \
+         ripcurrent-14.5 (Jul 2024) does not."
+    );
+}
 
-    let image_path = match (&args.image, &args.device) {
+/// First ROM-recovery port, optionally waiting for one to appear.
+fn find_rom_port(wait: Option<Duration>) -> Result<Option<String>> {
+    let started = std::time::Instant::now();
+    loop {
+        let devices = eub::find_devices()?;
+        if let Some(d) = devices.first() {
+            if devices.len() > 1 {
+                eprintln!(
+                    "more than one ROM device; using {} (pick with --port)",
+                    d.port
+                );
+            }
+            return Ok(Some(d.port.clone()));
+        }
+        match wait {
+            Some(limit) if started.elapsed() < limit => {
+                std::thread::sleep(Duration::from_millis(200))
+            }
+            _ => return Ok(None),
+        }
+    }
+}
+
+/// Open a port that may still be settling after re-enumeration ("resource
+/// busy" for a moment on macOS).
+fn open_port(name: &str) -> Result<Box<dyn eub::Link>> {
+    let mut last = None;
+    for _ in 0..15 {
+        match eub::open(name) {
+            Ok(p) => return Ok(p),
+            Err(e) => last = Some(e),
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Err(last.unwrap())
+}
+
+/// `fastboot devices` output, if fastboot is installed and sees something.
+fn fastboot_devices() -> Option<String> {
+    let out = std::process::Command::new("fastboot")
+        .arg("devices")
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+/// The recovery pack directory to use for a SoC when the user did not name
+/// a model: only possible when every model with a pack shares one.
+fn pack_for_soc(soc: devices::Soc) -> Result<Option<&'static devices::Model>> {
+    let candidates: Vec<&devices::Model> = devices::MODELS
+        .iter()
+        .filter(|m| {
+            m.soc == soc
+                && matches!(
+                    m.support,
+                    devices::Support::Verified | devices::Support::Pack
+                )
+        })
+        .collect();
+    let mut packs: Vec<&str> = candidates.iter().filter_map(|m| m.pack).collect();
+    packs.dedup();
+    match packs.len() {
+        0 => Ok(None),
+        1 => Ok(candidates.first().copied()),
+        _ => bail!(
+            "the ROM is {} {} ({}) and the recovery packs differ between those \
+             models; say which one with --device {}",
+            soc.tensor,
+            soc.name,
+            devices::family(soc),
+            devices::MODELS
+                .iter()
+                .filter(|m| m.soc == soc)
+                .map(|m| m.codename)
+                .collect::<Vec<_>>()
+                .join("|")
+        ),
+    }
+}
+
+fn boot(args: BootArgs) -> Result<()> {
+    let model = match &args.device {
+        Some(d) => {
+            let code = fetch::codename(d)?;
+            if let Some(q) = devices::qualcomm_model(&code) {
+                bail!(
+                    "{} ({code}) has a Qualcomm {}, not a Tensor SoC. A broken bootloader \
+                     leaves it in Qualcomm EDL mode (USB 05c6:9008), not Pixel ROM Recovery, \
+                     and recovering from EDL needs a Firehose programmer signed for the \
+                     device, which Google has never published",
+                    q.name,
+                    q.chipset
+                );
+            }
+            Some(devices::model(&code).ok_or_else(|| anyhow!("no SoC data for {code}"))?)
+        }
+        None => None,
+    };
+    if let Some(m) = model {
+        println!(
+            "device: {} ({}), {} {}: {}",
+            m.name,
+            m.codename,
+            m.soc.tensor,
+            m.soc.name,
+            m.support.label()
+        );
+    }
+    let use_pack = args.pack != "none";
+    let pack_path = match args.pack.as_str() {
+        "auto" | "none" => None,
+        p => Some(PathBuf::from(p)),
+    };
+
+    // Retail bootloader: given explicitly, or fetched when the model has no
+    // recovery pack (the ROM will most likely refuse it, but it is the only
+    // thing there is to try).
+    let image_path = match (&args.image, model) {
         (Some(p), _) => Some(p.clone()),
-        (None, Some(dev)) => {
-            let code = fetch::codename(dev)?;
-            let images = fetch::list_images(&code)?;
+        (None, Some(m)) if m.pack.is_none() || !use_pack => {
+            let images = fetch::list_images(m.codename)?;
             let image = fetch::pick_latest(&images, None)
-                .ok_or_else(|| anyhow!("no factory images listed for {code}"))?;
-            println!("{code}: {}", image.description);
+                .ok_or_else(|| anyhow!("no factory images listed for {}", m.codename))?;
+            println!("{}: {}", m.codename, image.description);
             Some(fetch::fetch_bootloader(image, std::path::Path::new("."))?)
         }
-        (None, None) => None,
+        _ => None,
     };
     let pack = match &image_path {
         Some(p) => Some(fbpk::load(p)?),
@@ -420,16 +561,94 @@ fn boot(args: BootArgs) -> Result<()> {
         }
     }
 
+    // Find the phone first: without --device, the ROM's chip id is what
+    // picks the recovery pack.
+    let explicit_port = args.port.is_some();
+    let port_name = match &args.port {
+        Some(p) => p.clone(),
+        None => {
+            if args.wait {
+                eprintln!("waiting for the phone in ROM-recovery mode ...");
+            }
+            find_rom_port(args.wait.then_some(Duration::MAX))?.ok_or_else(|| {
+                anyhow!(
+                    "no Pixel in ROM-recovery mode found. Hold Power + Volume Up + \
+                     Volume Down, plug in USB and keep holding ~15 s, or pass --wait."
+                )
+            })?
+        }
+    };
+    println!("found Pixel ROM Recovery on {port_name}");
+    let mut port = open_port(&port_name)?;
+
+    // `auto` adds a pack when the user named the model or gave nothing else
+    // to serve; explicit --image/--dir/--stage without --device are served
+    // as given (that is what tools/brick_test.sh relies on).
+    let explicit_sources = image_path.is_some() || args.dir.is_some() || !args.stage.is_empty();
+    let mut pack_model = model;
+    if use_pack && model.is_none() && pack_path.is_none() && !explicit_sources {
+        let mut serial = None;
+        for _ in 0..4 {
+            serial = eub::probe(port.as_mut(), Duration::from_secs(4))?;
+            if serial.is_some() || explicit_port {
+                break;
+            }
+            drop(port);
+            let p = find_rom_port(Some(Duration::from_secs(args.reconnect_wait)))?
+                .ok_or_else(|| anyhow!("the phone left ROM-recovery mode"))?;
+            port = open_port(&p)?;
+        }
+        let serial = serial.ok_or_else(|| anyhow!("the ROM never identified itself"))?;
+        match devices::soc_for_serial(&serial) {
+            Some(soc) => {
+                pack_model = pack_for_soc(soc)?;
+                if pack_model.is_none() {
+                    println!(
+                        "no recovery pack for {} {} ({}); the ROM will most likely refuse retail BL1",
+                        soc.tensor,
+                        soc.name,
+                        devices::family(soc)
+                    );
+                }
+            }
+            None => println!("ROM serial {serial}: unknown chip, no recovery pack"),
+        }
+    }
+
     let mut files = HashMap::new();
+    if use_pack {
+        let loaded = match (pack_model, &pack_path) {
+            (Some(m), _) if m.pack.is_some() => Some(packs::for_model(m, pack_path.as_deref())?),
+            (_, Some(path)) => Some(("given".to_string(), packs::load(path, "")?)),
+            _ => None,
+        };
+        if let Some((name, images)) = loaded {
+            let mut names: Vec<_> = images.keys().cloned().collect();
+            names.sort();
+            println!("recovery pack {name}: {}", names.join(" "));
+            if let Some(m) = pack_model.filter(|m| m.support == devices::Support::SiblingPack) {
+                println!(
+                    "  note: this pack was built for a sibling of the {}; its later stages \
+                     may not run on it. Layer the {} factory image under it with --image \
+                     to serve those instead (pack images win where both exist; override \
+                     single stages with --stage).",
+                    m.name, m.codename
+                );
+            }
+            files.extend(images);
+        }
+    }
     if let Some(dir) = &args.dir {
+        let mut found = 0;
         for name in LOOSE_IMAGE_NAMES {
             let path = dir.join(format!("{name}.img"));
             if path.is_file() {
                 files.insert(name.to_string(), std::fs::read(&path)?);
                 println!("loose image: {}", path.display());
+                found += 1;
             }
         }
-        if files.is_empty() {
+        if found == 0 {
             bail!(
                 "{} holds none of {}",
                 dir.display(),
@@ -441,6 +660,12 @@ fn boot(args: BootArgs) -> Result<()> {
         files.insert(
             name.to_ascii_lowercase(),
             std::fs::read(&path).with_context(|| format!("reading {path}"))?,
+        );
+    }
+    if files.is_empty() && pack.is_none() {
+        bail!(
+            "nothing to serve: give --device <codename>, --image <bootloader-*.img or \
+             factory.zip>, --dir or --stage"
         );
     }
     let remap = parse_kv(&args.map, "map")?
@@ -457,105 +682,110 @@ fn boot(args: BootArgs) -> Result<()> {
         if info.flags & 0x1 == 0 {
             println!(
                 "  note: bit 0 of the flags word (\"USB bootable\") is clear. The ROM only \
-                 accepts a BL1 signed with it set; retail factory images are not, and the \
-                 known-good recovery packs carry 0x211 here. Expect \"bl1 header fail\"."
+                 accepts a BL1 signed with it set; retail factory images are not. \
+                 Expect \"bl1 header fail\"."
             );
         }
     }
-    let mut opts = eub::BootOptions {
+    let opts = eub::BootOptions {
         checksum: parse_checksum(&args.checksum)?,
         generation: args.epbl.as_deref().map(|e| match e {
             "full" => stages::Generation::Legacy,
             _ => stages::Generation::Split,
         }),
+        expected_soc: model.map(|m| m.soc),
         send_stop: args.stop,
         verbose: args.verbose,
         idle_timeout: Duration::from_secs(args.idle_timeout),
-        startup_timeout: Duration::from_secs(args.idle_timeout),
+        settle: Duration::from_secs(3),
     };
 
-    let port_name = match &args.port {
-        Some(p) => p.clone(),
-        None => loop {
-            let devices = eub::find_devices()?;
-            if let Some(d) = devices.first() {
-                if devices.len() > 1 {
-                    eprintln!(
-                        "more than one ROM device; using {} (pick with --port)",
-                        d.port
-                    );
-                }
-                println!(
-                    "found Pixel ROM Recovery on {} (serial {})",
-                    d.port,
-                    d.serial.as_deref().unwrap_or("?")
-                );
-                break d.port.clone();
-            }
-            if !args.wait {
-                bail!(
-                    "no Pixel in ROM-recovery mode found. Hold Power + Volume Up + \
-                     Volume Down, plug in USB and keep holding ~15 s, or pass --wait."
-                );
-            }
-            std::thread::sleep(Duration::from_millis(500));
-        },
-    };
-
-    // The hand-off happens in phases: an early stage (BL2 on Pixel 8) takes
-    // over USB, re-enumerates, and carries on asking for stages on a fresh
-    // connection. Keep serving until the phone stops coming back as a ROM.
-    let mut all_stages: Vec<String> = Vec::new();
-    let mut port_name = port_name;
-    let mut phase = 1;
-    let clean_exit = loop {
-        let mut port = eub::open(&port_name)?;
-        let report = eub::boot(port.as_mut(), &sources, &opts)?;
+    let mut session = eub::Session::default();
+    let mut stalled = 0;
+    loop {
+        let before = session.stages_sent.len();
+        let ending = eub::boot(port.as_mut(), &sources, &opts, &mut session)?;
         drop(port);
-
-        if report.silent {
-            if phase == 1 {
-                bail!(
-                    "no message from the ROM for {:?}. Is the phone still in ROM-recovery mode?",
-                    opts.startup_timeout
-                );
+        let wait = Duration::from_secs(args.reconnect_wait);
+        let next = if explicit_port {
+            // A fixed port (a pty from tools/fake_rom.py, or a known device
+            // node): it is back when it opens again.
+            let started = std::time::Instant::now();
+            loop {
+                if let Ok(p) = eub::open(&port_name) {
+                    break Some((port_name.clone(), p));
+                }
+                if started.elapsed() > wait {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(200));
             }
-            // The device came back but asked for nothing more: the previous
-            // phase was the last one.
-            println!("no further requests on {port_name}");
-            break true;
-        }
-        all_stages.extend(report.stages_sent);
-        if !report.clean_exit {
-            break false;
-        }
-        match wait_for_rom(
-            args.port.as_deref(),
-            Duration::from_secs(args.reconnect_wait),
-        )? {
-            Some(next) => {
-                phase += 1;
-                println!("phone is back as a ROM device on {next}; continuing (phase {phase})");
-                port_name = next;
-                opts.startup_timeout = Duration::from_secs(args.reconnect_wait);
+        } else {
+            match find_rom_port(Some(wait))? {
+                Some(name) => Some((name.clone(), open_port(&name)?)),
+                None => None,
             }
-            None => break true,
+        };
+        let Some((next_name, next_port)) = next else {
+            break;
+        };
+        stalled = if session.stages_sent.len() > before {
+            0
+        } else {
+            stalled + 1
+        };
+        if stalled > 4 {
+            bail!("the phone keeps re-enumerating without asking for anything new");
         }
-    };
+        println!(
+            "phone {} after {}; reconnecting on {next_name}",
+            match ending {
+                eub::Ending::Disconnected => "re-enumerated",
+                eub::Ending::Quiet => "went quiet",
+            },
+            session
+                .stages_sent
+                .last()
+                .map(String::as_str)
+                .unwrap_or("connecting")
+        );
+        port = next_port;
+    }
 
     println!();
-    if all_stages.is_empty() {
+    if session.stages_sent.is_empty() {
         bail!("the ROM never asked for a stage");
     }
-    println!("sent {} stages: {}", all_stages.len(), all_stages.join(" "));
-    if clean_exit {
-        println!(
-            "The phone should now be in fastboot. Check with `fastboot devices`, then make it stick:\n\
-             \n  fastboot getvar battery-voltage   # want > 4200 mV before flashing\n  \
-             fastboot flash bootloader <bootloader-*.img>\n  \
-             fastboot reboot-bootloader\n  \
-             ./flash-all.sh                    # from the factory image"
-        );
+    println!(
+        "sent {} stages: {}",
+        session.stages_sent.len(),
+        session.stages_sent.join(" ")
+    );
+    println!("the phone has left ROM-recovery mode");
+    let mut fastboot = None;
+    for _ in 0..10 {
+        fastboot = fastboot_devices();
+        if fastboot.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
     }
+    match &fastboot {
+        Some(list) => println!("fastboot sees: {list}"),
+        None => println!("(fastboot does not see it yet, or is not installed)"),
+    }
+    let fetch_hint = match model.or(pack_model) {
+        Some(m) => format!("pixel-restore fetch {} --full", m.codename),
+        None => "pixel-restore fetch <codename> --full".to_string(),
+    };
+    println!(
+        "This bootloader runs from RAM only; a reboot or power loss before flashing \
+         puts the phone back in ROM recovery. Make it stick:\n\
+         \n  {fetch_hint}             # the factory image, then unzip it\n  \
+         fastboot getvar battery-voltage   # want > 4200 mV before flashing\n  \
+         fastboot flash bootloader bootloader-*.img\n  \
+         fastboot reboot-bootloader\n  \
+         ./flash-all.sh                    # wipes data; drop -w to keep it"
+    );
     Ok(())
 }
