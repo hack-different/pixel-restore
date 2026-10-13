@@ -3,6 +3,7 @@ mod dnw;
 mod eub;
 mod fbpk;
 mod fetch;
+mod modem;
 mod packs;
 mod remotezip;
 mod stages;
@@ -32,6 +33,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Diagnose modem/sign-in failures and prepare original-IMEI restoration.
+    #[command(disable_help_flag = true)]
+    Modem {
+        /// Arguments forwarded to the bundled Python modem tools; use --help.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Look for a Pixel in ROM-recovery mode and print its serial port.
     Detect {
         /// Also list every other serial port, to help spot the phone when
@@ -166,6 +174,7 @@ fn main() {
 
 fn run() -> Result<()> {
     match Cli::parse().cmd {
+        Cmd::Modem { args } => modem::run(&args),
         Cmd::Detect { all, wait } => detect(all, wait),
         Cmd::Unpack { image, out } => unpack(&image, out.as_deref()),
         Cmd::Boot(args) => boot(args),

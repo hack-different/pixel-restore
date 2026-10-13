@@ -19,6 +19,21 @@ ZIP) itself instead of needing pre-extracted images, and it is request driven,
 so it serves whatever stage the ROM asks for rather than following a fixed
 per-model script.
 
+## Modem and Google sign-in repair
+
+For phones that already boot Android, `pixel-restore modem` adds sign-in
+error diagnostics, verified modem-partition backups, pinned upstream source
+fetches, and an experimental original-IMEI devinfo repair workflow for Pixel 9
+Pro XL. It previews changes by default and does not run upstream scripts.
+See [Modem repair tools](docs/modem-repair.md) for requirements, reviewed source
+revisions, Android 17 limitations, and explicit write instructions.
+
+```sh
+pixel-restore modem --help
+pixel-restore modem sources
+pixel-restore modem diagnose --serial YOUR_ADB_SERIAL
+```
+
 ## Build
 
 ```sh
