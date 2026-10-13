@@ -1,0 +1,13 @@
+[package]
+name = "pixel_low_level_boot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+argparse = "0.2.2"
+hex = { version = "0.4.3", features = ["alloc"] }
+regex = "1.10.6"
+serialport = "4.5.0"
+uart = "0.1.2"
+usb = "0.2.2"
+xmodem = "0.1.3"

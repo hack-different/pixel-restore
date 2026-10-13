@@ -424,3 +424,95 @@ fn is_disconnect(e: &std::io::Error) -> bool {
     ) || e.raw_os_error() == Some(6) // ENXIO: device vanished (macOS/Linux)
         || e.raw_os_error() == Some(5) // EIO on a gone tty
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::io::{self, Cursor};
+
+    struct FakeRom {
+        incoming: Cursor<Vec<u8>>,
+        outgoing: Vec<u8>,
+    }
+    impl Read for FakeRom {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.incoming.read(buf)?;
+            if n == 0 {
+                Err(io::ErrorKind::BrokenPipe.into())
+            } else {
+                Ok(n)
+            }
+        }
+    }
+    impl Write for FakeRom {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.outgoing.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    fn options() -> BootOptions {
+        BootOptions {
+            checksum: Checksum::default(),
+            generation: None,
+            expected_soc: None,
+            send_stop: false,
+            verbose: false,
+            idle_timeout: Duration::from_secs(1),
+            settle: Duration::from_secs(1),
+        }
+    }
+    #[test]
+    fn legacy_request_payload_is_sent_unchanged_in_a_dnw_frame() {
+        // Lowercase request, a serial too large for the prototype's i64 parser,
+        // a pre-split body, and a bare clear-to-send byte.
+        let mut port = FakeRom {
+            incoming: Cursor::new(b"eub:req:09875001abcdef0123456789:ablb\r\nC".to_vec()),
+            outgoing: Vec::new(),
+        };
+        let payload = vec![0x5a; stages::HEADER_LEN + 23];
+        let sources = Sources {
+            pack: None,
+            files: HashMap::new(),
+            remap: HashMap::new(),
+            request_files: Some(HashMap::from([("ABLB".into(), payload.clone())])),
+        };
+        let mut session = Session::default();
+        assert_eq!(
+            boot(&mut port, &sources, &options(), &mut session).unwrap(),
+            Ending::Disconnected
+        );
+        let frame = &port.outgoing;
+        assert_eq!(&frame[..4], b"\x1bDNW");
+        assert_eq!(
+            u32::from_le_bytes(frame[4..8].try_into().unwrap()) as usize,
+            payload.len() + 10
+        );
+        assert_eq!(&frame[8..frame.len() - 2], payload);
+        assert_eq!(&frame[frame.len() - 2..], &[255, 255]);
+        assert_eq!(session.stages_sent, ["ABLB"]);
+    }
+    #[test]
+    fn a_missing_request_file_stops_before_upload() {
+        let mut port = FakeRom {
+            incoming: Cursor::new(b"eub:req:09875001abcdef0123456789:BL1\r\nC".to_vec()),
+            outgoing: Vec::new(),
+        };
+        let sources = Sources {
+            pack: None,
+            files: HashMap::new(),
+            remap: HashMap::new(),
+            request_files: Some(HashMap::new()),
+        };
+        let mut session = Session::default();
+        assert!(boot(&mut port, &sources, &options(), &mut session)
+            .unwrap_err()
+            .to_string()
+            .contains("no exact payload"));
+        assert!(port.outgoing.is_empty());
+        assert!(session.stages_sent.is_empty());
+    }
+}

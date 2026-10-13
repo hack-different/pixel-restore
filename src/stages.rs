@@ -140,6 +140,9 @@ pub struct Sources {
     pub files: HashMap<String, Vec<u8>>,
     /// Explicit `REQUEST=partition` overrides from the command line.
     pub remap: HashMap<String, String>,
+    /// Exact per-request payloads from the historical firmware-directory workflow.
+    /// Some means exclusive mode: missing requests fail instead of guessing.
+    pub request_files: Option<HashMap<String, Vec<u8>>>,
 }
 
 impl Sources {
@@ -206,6 +209,15 @@ impl Sources {
     /// Produce the exact bytes to upload for a ROM request. Returns the
     /// payload plus a human-readable description of where it came from.
     pub fn payload_for(&self, stage: &str, generation: Generation) -> Result<(Vec<u8>, String)> {
+        if let Some(files) = &self.request_files {
+            let bytes = files.get(stage).ok_or_else(|| {
+                anyhow!("no exact payload for ROM request '{stage}' in --firmware directory")
+            })?;
+            return Ok((
+                bytes.clone(),
+                format!("{stage}.bin (exact request payload)"),
+            ));
+        }
         let (partition, part) = match self.remap.get(stage) {
             Some(p) => (
                 p.as_str(),
@@ -284,6 +296,7 @@ mod tests {
             pack: Some(Pack::parse(img).unwrap()),
             files: HashMap::new(),
             remap: HashMap::new(),
+            request_files: None,
         }
     }
 
@@ -357,6 +370,7 @@ mod tests {
             pack: None,
             files: HashMap::new(),
             remap: HashMap::new(),
+            request_files: None,
         };
         s.files.insert("gsa".into(), vec![1u8; 10]);
         s.files.insert("gsaf".into(), vec![2u8; 20]);
@@ -387,6 +401,7 @@ mod tests {
             pack: None,
             files: HashMap::new(),
             remap: HashMap::new(),
+            request_files: None,
         };
         s.files.insert("gsa".into(), tagged(b"GSAF", 1, 100));
         s.files.insert("gsaf".into(), tagged(b"GSA1", 2, 50));
@@ -404,5 +419,22 @@ mod tests {
         );
         assert_eq!(header_tag(&tagged(b"BL2\0", 0, 1)).as_deref(), Some("BL2"));
         assert_eq!(header_tag(&[0xffu8; HEADER_LEN]), None);
+    }
+    #[test]
+    fn exact_payloads_are_not_sliced_or_replaced_by_partition_data() {
+        let mut s = sources();
+        s.request_files = Some(HashMap::from([
+            ("ABL".into(), vec![1; 32]),
+            ("ABLB".into(), vec![2; HEADER_LEN + 17]),
+            ("CUSTOM_STAGE".into(), vec![3; 9]),
+        ]));
+        for generation in [Generation::Legacy, Generation::Split] {
+            for (stage, want) in s.request_files.as_ref().unwrap() {
+                assert_eq!(&s.payload_for(stage, generation).unwrap().0, want);
+            }
+        }
+        // Even an available pack image or synthetic DPM must not fill a gap.
+        assert!(s.payload_for("BL1", Generation::Split).is_err());
+        assert!(s.payload_for("DPM", Generation::Split).is_err());
     }
 }
