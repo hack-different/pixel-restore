@@ -3,6 +3,7 @@ mod dnw;
 mod eub;
 mod fbpk;
 mod fetch;
+mod firmware;
 mod modem;
 mod packs;
 mod remotezip;
@@ -118,6 +119,12 @@ struct BootArgs {
     /// instead of, or on top of, --image.
     #[arg(long, short)]
     dir: Option<PathBuf>,
+
+    /// Directory of exact per-request payloads (BL1.bin, ABL.bin, ABLB.bin).
+    /// Each file is sent unchanged using DNW; no image slicing or pack fallback.
+    /// Migrates the restore_pixel_tensor firmware-directory workflow.
+    #[arg(long, short = 'f', conflicts_with_all = ["image", "device", "pack", "dir", "stage", "map"])]
+    firmware: Option<PathBuf>,
 
     /// Serve one partition from a specific file: `--stage abl=/path/abl.img`.
     /// Repeatable. Wins over --dir and --image.
@@ -523,7 +530,9 @@ fn boot(args: BootArgs) -> Result<()> {
             m.support.label()
         );
     }
-    let use_pack = args.pack != "none";
+    // Validate local request files before opening a port or fetching images.
+    let request_files = args.firmware.as_deref().map(firmware::load).transpose()?;
+    let use_pack = args.pack != "none" && request_files.is_none();
     let pack_path = match args.pack.as_str() {
         "auto" | "none" => None,
         p => Some(PathBuf::from(p)),
@@ -671,7 +680,7 @@ fn boot(args: BootArgs) -> Result<()> {
             std::fs::read(&path).with_context(|| format!("reading {path}"))?,
         );
     }
-    if files.is_empty() && pack.is_none() {
+    if files.is_empty() && pack.is_none() && request_files.is_none() {
         bail!(
             "nothing to serve: give --device <codename>, --image <bootloader-*.img or \
              factory.zip>, --dir or --stage"
@@ -682,7 +691,12 @@ fn boot(args: BootArgs) -> Result<()> {
         .map(|(k, v)| (k.to_ascii_uppercase(), v.to_ascii_lowercase()))
         .collect();
 
-    let sources = stages::Sources { pack, files, remap };
+    let sources = stages::Sources {
+        pack,
+        files,
+        remap,
+        request_files,
+    };
     if let Some(info) = sources.partition("bl1").and_then(stages::header_info) {
         println!(
             "bl1 header: magic {:#010x}, body {} bytes, flags {:#010x}",
@@ -797,4 +811,53 @@ fn boot(args: BootArgs) -> Result<()> {
          ./flash-all.sh                    # wipes data; drop -w to keep it"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_firmware_directory_uses_an_explicit_port() {
+        let cli = Cli::try_parse_from([
+            "pixel-restore",
+            "boot",
+            "-f",
+            "firmware",
+            "--port",
+            "/dev/test",
+        ])
+        .unwrap();
+        let Cmd::Boot(args) = cli.cmd else {
+            panic!("expected boot")
+        };
+        assert_eq!(args.firmware, Some(PathBuf::from("firmware")));
+        assert_eq!(args.port.as_deref(), Some("/dev/test"));
+        assert_eq!(args.pack, "auto"); // implicit default must not conflict
+    }
+
+    #[test]
+    fn exact_request_files_cannot_mix_with_partition_sources() {
+        for (flag, value) in [
+            ("--image", "bootloader.img"),
+            ("--device", "husky"),
+            ("--pack", "none"),
+            ("--dir", "images"),
+            ("--stage", "abl=abl.img"),
+            ("--map", "ABL=abl"),
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "pixel-restore",
+                    "boot",
+                    "--firmware",
+                    "firmware",
+                    flag,
+                    value,
+                ])
+                .is_err(),
+                "accepted conflicting {flag}"
+            );
+        }
+    }
 }

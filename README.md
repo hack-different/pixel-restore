@@ -300,3 +300,18 @@ Google's `fbpack.py` / `fbpacktool.py` published on source.android.com. The
 USB-bootable recovery packs are not bundled; `boot` downloads JoshuaDoes'
 tensor-usbdl v0.2.0 release from GitHub at run time and reads only its
 `sources/` images.
+
+## restore_pixel_tensor integration
+
+The original Tensor recovery prototype and its Git history are preserved under
+[`legacy/restore_pixel_tensor`](legacy/restore_pixel_tensor). Its per-request
+firmware-file workflow is available in this tool:
+
+```sh
+pixel-restore boot --firmware ./firmware --port /dev/cu.usbmodem1234
+```
+
+This sends exact `STAGE.bin` payloads using the current DNW transport. It does not
+run the prototype's XMODEM implementation. See the
+[migration guide](docs/tensor-migration.md) for file layout, CLI differences,
+and validation limits. Development belongs in `hack-different/pixel-restore`.
