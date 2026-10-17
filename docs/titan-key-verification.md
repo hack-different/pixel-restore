@@ -11,6 +11,10 @@ sends a state-changing command to the chip.
 
 ## Two different keys
 
+For how the chip's four images (RO_A/RW_A/RO_B/RW_B) are laid out in flash, and
+the Citadel->Dauntless flash-size bug that could turn an RO region into an RW
+one, see `docs/titan-flash-layout.md`.
+
 There are two distinct "root of trust" keys on the phone, at two layers.
 
 1. **The Titan M firmware signing key.** Each Titan M image (RO_A, RO_B, RW_A,
