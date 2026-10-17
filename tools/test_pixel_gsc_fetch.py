@@ -325,6 +325,30 @@ class HttpTests(unittest.TestCase):
             self.assertEqual(len(bl[0]["releases"]), 2)
             # The carrier build 404s on the test server and is recorded as an error.
             self.assertIn("error", man["images"]["komodo-cp3a.260905.009.v1-factory-deadbeef.zip"])
+            # `unique` keeps one file per SHA-256 and `--prune` drops the per-release copies.
+            g.main(["unique", "--out", str(out)])
+            uidx = json.loads((out / "unique/index.json").read_text())
+            self.assertEqual(len(uidx["blobs"]), rep["distinct_blobs"])
+            ubl = next(b for b in uidx["blobs"] if b["kind"] == "bootloader")
+            self.assertEqual(ubl["path"], f"unique/bootloader/bootloader-komodo-ripcurrent-1-{ubl['sha256'][:12]}.img")
+            self.assertEqual((out / ubl["path"]).read_bytes(), BL)
+            self.assertEqual(len(ubl["releases"]), 2)
+            ec = Path(d, "ec")
+            g.main(["unique", "--out", str(out), "--dest", str(ec), "--kinds", "gsc,bin"])
+            eidx = json.loads((ec / "index.json").read_text())
+            self.assertEqual({b["kind"] for b in eidx["blobs"]}, {"gsc"})
+            def uname(b):  # d3m2.ec.bin -> d3m2.ec-<sha12>.bin; the FBPK partition "d3m2" -> d3m2-<sha12>
+                stem, dot, ext = b["name"].rpartition(".")
+                return f"{stem}-{b['sha256'][:12]}.{ext}" if stem else f"{ext}-{b['sha256'][:12]}"
+            self.assertEqual(sorted(p.name for p in ec.iterdir() if p.suffix != ".json"),
+                             sorted(uname(b) for b in eidx["blobs"]))
+            self.assertTrue(all(Path(b["path"]).is_absolute() and Path(b["path"]).is_file() for b in eidx["blobs"]))
+            g.main(["unique", "--out", str(out), "--prune"])
+            self.assertFalse((out / same[0]["path"]).exists())
+            self.assertFalse((out / "komodo/cp3a.260905.009").exists())
+            self.assertTrue((out / "komodo/cp3a.260905.009.json").is_file())
+            self.assertEqual((out / ubl["path"]).read_bytes(), BL)
+            self.assertEqual(len(list((out / "unique").rglob("*-*"))), rep["distinct_blobs"])
 
 
 @unittest.skipUnless(shutil.which("mke2fs"), "mke2fs not installed")
