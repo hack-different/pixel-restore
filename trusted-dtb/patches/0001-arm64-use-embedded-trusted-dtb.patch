@@ -17,6 +17,13 @@ tree:
 The swap happens before arm64_memblock_init(), so /reserved-memory is scanned
 from OUR tree -- that is the point: we decide what Linux may map.
 
+ACK android14-6.1 caveat: this seam is correct only while
+early_init_fdt_scan_reserved_mem() is still called from inside
+arm64_memblock_init(). Google occasionally reorders this; if it runs before
+our swap, reserved-memory would come from the bootloader tree and the swap
+must move earlier to match. Verify before relying on the reserved-memory
+override.
+
 This is a NON-UPSTREAM patch for a controlled investigation. It does not
 change behaviour unless CONFIG_PIXEL_TRUSTED_DTB=y. Line numbers below match
 torvalds v6.1; adjust context for the ACK android14-6.1 tree.

@@ -101,6 +101,10 @@ Possible in principle, none supported:
      `/sys/firmware/fdt` from our fastbootd: that captures the dtbo overlay
      and every bootloader fixup.
    Cost: the kernel diverges from AD1A source by one small, auditable patch.
+   Bonus: this sidesteps the 2 MB DTB limit from §1. That limit is on the
+   *early fixmap* mapping of the bootloader's blob; our blob is `.incbin`'d
+   into the Image and reached through the normal kernel mapping, so a ~3 MB
+   komodo tree is fine with no `FDT_MAX_SIZE` change.
 3. **Initramfs / first-stage init.** Too late: the DT is unflattened in
    `setup_arch()`, long before the initramfs is unpacked, and every
    platform driver binds against it. Init cannot replace the base DT.

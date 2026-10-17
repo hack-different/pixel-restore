@@ -20,6 +20,12 @@
  *   - Removing a reserved-memory region the firmware still fences in hardware
  *     (SMMU/MPU, GSA/Titan) does NOT make it readable; the kernel will fault
  *     or the device will secure-reboot. Test each region (see runbook).
+ *   - DO NOT delete /reserved-memory wholesale. The bootloader loads
+ *     pvmfw/pKVM into a carveout described there, and route (A)'s built-in
+ *     initramfs depends on pKVM. Dropping that node => kernel won't reserve
+ *     it => pKVM init faults or its region gets stomped => boot failure.
+ *     Be surgical: delete ONLY the carveouts you want to reclaim, and make an
+ *     explicit pvmfw/pKVM decision (see the pvmfw block below).
  *
  * Start SMALL: flip one node, build, boot, see if it probes, before adding
  * more. A tree that won't probe anything is harder to debug than one change.
@@ -61,6 +67,16 @@
 	/* /delete-node/ modem_shmem; */
 	/* /delete-node/ gsa_reserved; */
 	/* /delete-node/ tpu_fw_reserved; */
+
+	/*
+	 * DO NOT delete the pvmfw / pKVM carveout here unless you have ALSO
+	 * disabled pKVM in the defconfig (CONFIG_KVM / protected-KVM off).
+	 * Keeping the node is the safe default. Disabling pKVM entirely is the
+	 * alternative and, as a bonus for a forensic build, widens EL1
+	 * visibility (no hypervisor interposing) — so for this use case the
+	 * "disable pKVM in defconfig + reclaim its carveout" combo may be
+	 * preferred. Decide explicitly; don't leave it implicit.
+	 */
 };
 
 /*

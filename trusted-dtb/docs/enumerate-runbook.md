@@ -83,6 +83,22 @@ cat /proc/iomem | grep -i <region>     # is it claimed/mapped now?
 # faults means hardware still fences it.
 ```
 
+## pKVM / pvmfw decision (make this before step 1)
+
+The bootloader loads pvmfw/pKVM into a `/reserved-memory` carveout, and route
+(A)'s built-in initramfs depends on pKVM being intact. Two valid configs:
+
+- **Keep pKVM:** leave the pvmfw carveout node in the trusted tree. Safe
+  default; the hypervisor still interposes.
+- **Disable pKVM:** turn protected-KVM off in the defconfig *and* then you may
+  reclaim its carveout. For a forensic build this also widens EL1 visibility
+  (nothing between the kernel and the hardware). Likely the preferred combo
+  here.
+
+What you must not do: delete the pvmfw carveout while pKVM is still enabled —
+pKVM init faults or its region is stomped and the phone won't boot. The
+override template calls this out; decide explicitly.
+
 ## 5. Iterate
 
 One change at a time. If a controller won't probe, it is almost always a

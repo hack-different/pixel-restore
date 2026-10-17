@@ -72,3 +72,15 @@ the swap-point logic is the same but line numbers differ). The Fastbootd
 thread owns the actual kernel build and should treat the patch as a diff to
 adapt and compile, not as drop-in. Nothing here has been built or run against
 hardware yet.
+
+Reviewed-against-boot-path notes (confirm in the ACK tree before building):
+- **The swap seam is correct only if `early_init_fdt_scan_reserved_mem()` is
+  still called from inside `arm64_memblock_init()`.** Google sometimes
+  reorders this; if it moved earlier than our swap, reserved-memory would be
+  scanned from the bootloader tree instead of ours and the swap must move
+  with it.
+- `kaslr-seed` is a non-issue: KASLR consumes the bootloader FDT in `head.S`
+  long before `setup_arch()`, and we preserve `/chosen` anyway.
+- The blob being `.incbin`'d (kernel mapping, not early fixmap) is why the
+  2 MB fixmap DTB limit doesn't apply — komodo's ~3 MB tree needs no
+  `FDT_MAX_SIZE` change.
