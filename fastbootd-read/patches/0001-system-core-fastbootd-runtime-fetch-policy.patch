@@ -1,0 +1,165 @@
+diff --git a/system/core/fastboot/Android.bp b/system/core/fastboot/Android.bp
+index d0938ee..868b5de 100644
+--- a/system/core/fastboot/Android.bp
++++ b/system/core/fastboot/Android.bp
+@@ -150,6 +150,7 @@ cc_binary {
+ 
+     srcs: [
+         "device/commands.cpp",
++        "device/fetch_policy.cpp",
+         "device/fastboot_device.cpp",
+         "device/flashing.cpp",
+         "device/main.cpp",
+diff --git a/system/core/fastboot/device/commands.cpp b/system/core/fastboot/device/commands.cpp
+index e522f4d..9de2a47 100644
+--- a/system/core/fastboot/device/commands.cpp
++++ b/system/core/fastboot/device/commands.cpp
+@@ -48,6 +48,8 @@
+ #include "flashing.h"
+ #include "utility.h"
+ 
++#include "fetch_policy.h"
++
+ #ifdef FB_ENABLE_FETCH
+ static constexpr bool kEnableFetch = true;
+ #else
+@@ -750,7 +752,7 @@ namespace {
+ class PartitionFetcher {
+   public:
+     static bool Fetch(FastbootDevice* device, const std::vector<std::string>& args) {
+-        if constexpr (!kEnableFetch) {
++        if (!kEnableFetch && GetFetchPolicy() == kFetchPolicyStock) {
+             return device->WriteFail("Fetch is not allowed on user build");
+         }
+ 
+@@ -779,10 +781,12 @@ class PartitionFetcher {
+         }
+ 
+         partition_name_ = args_->at(1);
+-        if (std::find(kAllowedPartitions.begin(), kAllowedPartitions.end(), partition_name_) ==
+-            kAllowedPartitions.end()) {
+-            ret_ = device_->WriteFail("Fetch is only allowed on [" +
+-                                      android::base::Join(kAllowedPartitions, ", ") + "]");
++        if (GetFetchPolicy() < kFetchPolicyReadAll &&
++            std::find(kAllowedPartitions.begin(), kAllowedPartitions.end(), partition_name_) ==
++                    kAllowedPartitions.end()) {
++            ret_ = device_->WriteFail(
++                    "Fetch is only allowed on [" + android::base::Join(kAllowedPartitions, ", ") +
++                    "] until reading is enabled from the on-screen fastboot menu");
+             return false;
+         }
+ 
+@@ -837,7 +841,8 @@ class PartitionFetcher {
+             return false;
+         }
+ 
+-        if (total_size_to_read_ > kMaxFetchSizeDefault) {
++        if (GetFetchPolicy() < kFetchPolicyUnrestricted &&
++            total_size_to_read_ > kMaxFetchSizeDefault) {
+             ret_ = device_->WriteFail(android::base::StringPrintf(
+                     "Cannot fetch 0x%" PRIx64
+                     " bytes because it exceeds maximum transport size 0x%x",
+diff --git a/system/core/fastboot/device/fetch_policy.cpp b/system/core/fastboot/device/fetch_policy.cpp
+new file mode 100644
+index 0000000..c83fcf0
+--- /dev/null
++++ b/system/core/fastboot/device/fetch_policy.cpp
+@@ -0,0 +1,38 @@
++/*
++ * Copyright (C) 2026 The pixel-restore authors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "fetch_policy.h"
++
++#include <string>
++
++#include <android-base/file.h>
++#include <android-base/parseint.h>
++#include <android-base/strings.h>
++
++int GetFetchPolicy() {
++    std::string data;
++    if (!android::base::ReadFileToString(FASTBOOTD_FETCH_POLICY_PATH, &data)) {
++        return kFetchPolicyStock;
++    }
++    int value = kFetchPolicyStock;
++    if (!android::base::ParseInt(android::base::Trim(data), &value)) {
++        return kFetchPolicyStock;
++    }
++    if (value < kFetchPolicyStock || value > kFetchPolicyUnrestricted) {
++        return kFetchPolicyStock;
++    }
++    return value;
++}
+diff --git a/system/core/fastboot/device/fetch_policy.h b/system/core/fastboot/device/fetch_policy.h
+new file mode 100644
+index 0000000..8cfc8b2
+--- /dev/null
++++ b/system/core/fastboot/device/fetch_policy.h
+@@ -0,0 +1,54 @@
++/*
++ * Copyright (C) 2026 The pixel-restore authors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#pragma once
++
++// Runtime "fetch" (partition read) policy for fastbootd.
++//
++// Upstream fastbootd only lets `fastboot fetch` read a fixed three-entry
++// allow-list (vendor_boot, vendor_boot_a, vendor_boot_b). This policy lets the
++// phone's owner widen that at run time, but only from the on-screen fastboot
++// menu in recovery, behind a warning and a confirmation. Nothing here is
++// reachable over USB: the host cannot change the policy, it can only read
++// partitions the owner has already unlocked on the device.
++//
++// The policy is carried in a tiny tmpfs state file so the recovery UI process
++// (the writer, which draws the menu) and the fastbootd daemon process (the
++// reader, which serves USB) can share it without adding any fastboot/oem
++// command. Reading is deliberately fail-safe: any error reads back as stock.
++//
++// Every policy level is READ ONLY. None of them touches flash, erase, or any
++// write path; those keep their upstream locked-device gating untouched.
++
++enum FetchPolicy {
++    // Upstream behaviour: fetch is limited to the built-in allow-list.
++    kFetchPolicyStock = 0,
++    // "Enable reading": fetch is allowed for any partition fastbootd can open
++    // by name (modem, efs, efs_backup, persist, devinfo, boot chain, ...).
++    // The per-transfer size cap is still enforced.
++    kFetchPolicyReadAll = 1,
++    // "Enable all partitions": as above, and the per-transfer size cap is also
++    // lifted, so arbitrarily large partitions (super, userdata, ...) can be
++    // read in one fetch. Still read only.
++    kFetchPolicyUnrestricted = 2,
++};
++
++// Absolute path of the state file, in the recovery ramdisk tmpfs. Both the
++// recovery UI and the fastbootd daemon run from the same ramdisk.
++#define FASTBOOTD_FETCH_POLICY_PATH "/dev/fastbootd_fetch_policy"
++
++// Read the current policy. Returns kFetchPolicyStock if the state file is
++// absent, unreadable, or malformed, so the safe default always wins.
++int GetFetchPolicy();
