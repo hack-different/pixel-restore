@@ -5,9 +5,11 @@
 #
 #   ./docker/build.sh            # sync + vendor + patch + build (re-runs are incremental)
 #   ./docker/build.sh shell      # a shell in the container, tree at /aosp
+#   ./docker/build.sh boot [...] # boot the result on the phone from RAM
 #
-# All of the work happens inside the container (scripts/container-build.sh).
-# Nothing here talks to a phone.
+# The build happens inside the container (scripts/container-build.sh) and does
+# not talk to a phone. `boot` runs scripts/boot-fastbootd.sh on this host, which
+# only ever `fastboot boot`s the image into RAM; see its --help.
 #
 # Where the source tree lives:
 #   By default in a Docker named volume ($VOLUME). On a Mac that is the right
@@ -42,10 +44,15 @@ PLATFORM="${PLATFORM:-linux/amd64}"
 VOLUME="${VOLUME:-fastbootd-read-src}"
 ARTIFACTS="${ARTIFACTS:-$repo_root/out/$DEVICE}"
 mode="${1:-build}"
+[ $# -gt 0 ] && shift
 case "$mode" in
-  build|shell) ;;
-  *) echo "usage: $0 [build|shell]" >&2; exit 2 ;;
+  build|shell|boot) ;;
+  *) echo "usage: $0 [build|shell|boot [boot-fastbootd.sh options]]" >&2; exit 2 ;;
 esac
+boot_image="$ARTIFACTS/fastbootd-boot.img"
+if [ "$mode" = boot ] && [ -f "$boot_image" ]; then
+  exec "$repo_root/scripts/boot-fastbootd.sh" --image "$boot_image" "$@"
+fi
 
 command -v docker >/dev/null || { echo "!! docker is not installed" >&2; exit 1; }
 docker info >/dev/null 2>&1 || { echo "!! the Docker daemon is not running" >&2; exit 1; }
@@ -76,7 +83,7 @@ for v in BRANCH TAG MANIFEST_URL VARIANT LUNCH_TARGET SYNC VENDOR JOBS; do
   [ -n "${!v:-}" ] && env_args+=(-e "$v=${!v}")
 done
 
-run=(docker run --rm "${tty[@]}" --platform "$PLATFORM"
+run=(docker run --rm ${tty[@]+"${tty[@]}"} --platform "$PLATFORM"
   -v "$src_mount":/aosp
   -v "$repo_root":/patches:ro
   -v "$ccache_mount":/ccache
@@ -86,6 +93,12 @@ run=(docker run --rm "${tty[@]}" --platform "$PLATFORM"
 
 if [ "$mode" = shell ]; then
   exec "${run[@]}" bash
+fi
+if [ "$mode" = boot ]; then
+  # Built before the RAM-boot image existed: assemble it from the artifacts.
+  echo ">> Assembling $boot_image"
+  "${run[@]}" python3 -I /patches/scripts/make_ram_boot_image.py /artifacts
+  exec "$repo_root/scripts/boot-fastbootd.sh" --image "$boot_image" "$@"
 fi
 echo ">> Source tree: $src_mount   artifacts: $ARTIFACTS"
 "${run[@]}" bash /patches/scripts/container-build.sh

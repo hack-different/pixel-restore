@@ -38,13 +38,15 @@ That one command builds the container, then inside it
 3. `repo start fastbootd-read` on `system/core` and `bootable/recovery`, then
    applies the two patches there.
 4. `lunch komodo-cur-userdebug` and
-   `m fastbootd recovery bootimage vendorbootimage vendorkernelbootimage`.
+   `m fastbootd recovery bootimage initbootimage vendorbootimage vendorkernelbootimage`.
 5. Runs `scripts/make-boot-image.sh`, which greps the built
    `fastbootd`/recovery ramdisk for the patched string and fails loudly if the
    rebuild did not take.
-6. Copies `boot.img`, `vendor_boot.img`, `vendor_kernel_boot.img`, the
-   `fastbootd` binary and a pinned `manifest.xml` to
-   `fastbootd-read/out/komodo/`.
+6. Copies `boot.img`, `init_boot.img`, `vendor_boot.img`,
+   `vendor_kernel_boot.img`, the `fastbootd` binary and a pinned `manifest.xml`
+   to `fastbootd-read/out/komodo/`.
+7. Assembles `fastbootd-boot.img` there, the image `./docker/build.sh boot`
+   loads into RAM (see below).
 
 The tree lives in the Docker volume `fastbootd-read-src`. On a Mac that matters:
 it is a case-sensitive Linux filesystem, which AOSP needs and a normal APFS
@@ -67,32 +69,82 @@ can update `system/core` and `bootable/recovery`, then they are applied again.
 
 ## Boot it TEMPORARILY (no flash)
 
-Prerequisites: the **bootloader is unlocked** (reading is refused on a locked
-device by design), and `fastboot` is on your PATH. Confirm lock state first:
+Put the phone in the **bootloader** (Power + Volume Down; not fastbootd), plug it
+in, and run:
 
 ```sh
-fastboot getvar unlocked      # want: unlocked: yes
+./docker/build.sh boot              # or: ./scripts/boot-fastbootd.sh [--serial S]
 ```
 
-The intent is to run the modified fastbootd from RAM via `fastboot boot`, so
-nothing on the phone changes. The exact image to boot and whether komodo's
-bootloader enters fastbootd from `fastboot boot` is the one step that must be
-confirmed on your device — it depends on komodo's boot/vendor_boot layout and
-cannot be validated from a cloud container. Work it out with the phone in hand:
+Before sending anything that changes state, it checks, all read only:
+`fastboot` is on PATH; exactly one phone is in fastboot (or `--serial`); it is in
+the bootloader (`is-userspace: no`); `unlocked: yes`; the image exists, was
+built for this product, and fits `max-download-size`. It shows the command and
+asks you to type `yes` (`--yes` skips the prompt).
 
-1. Build as above; keep `$OUT`.
-2. From the running system or bootloader, enter stock fastbootd once to learn
-   the normal path: `adb reboot fastboot` (or `fastboot reboot fastboot` from
-   bootloader).
-3. Try booting the rebuilt image from RAM and watch whether the phone comes up
-   in the **modified** fastbootd (the on-screen menu will show the two new
-   entries). The image and `fastboot boot` invocation are komodo-specific;
-   `make-boot-image.sh` prints the artifacts to work from.
+Then it runs exactly one state-changing command:
 
-If `fastboot boot` will not enter the modified fastbootd on komodo, the only
-alternative is flashing (e.g. the inactive slot), which **writes to the phone**.
-komodo has no USB-boot rescue, so that decision — and the go-ahead — is yours;
-nothing in this repo flashes on its own.
+```sh
+fastboot -s <serial> boot out/komodo/fastbootd-boot.img
+```
+
+The bootloader loads the image into RAM and starts it. Nothing is flashed, and
+a reboot returns the phone to what is installed.
+
+### Why a special image
+
+On komodo the recovery binary and fastbootd live in the **vendor_boot**
+ramdisk (`BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT`), and the generic
+ramdisk is in **init_boot**. `fastboot boot` only replaces boot.img; the
+bootloader still loads vendor_boot, vendor_kernel_boot and init_boot from the
+phone. Booting the plain boot.img would therefore bring up the phone's stock
+fastbootd.
+
+`scripts/make_ram_boot_image.py` (run at the end of the build, or by
+`build.sh boot` for an older build) makes `fastbootd-boot.img`: a header-v4
+boot image with the built kernel and one ramdisk that concatenates every built
+ramdisk in boot order: vendor_boot fragments, vendor_kernel_boot, init_boot.
+The bootloader places the boot image's ramdisk after the ones it loads from the
+phone, and the kernel unpacks concatenated archives in order. So the built
+files win: `system/bin/fastbootd`, the recovery binary with the new menu, and
+kernel modules that match the built kernel.
+
+### What it does after `fastboot boot`
+
+It waits for the phone to leave the bootloader and come back over USB, then
+reports:
+
+- **Read-enabled fastbootd** (`is-userspace: yes`, and a `fetch` probe is
+  refused with the patched "until reading is enabled from the on-screen
+  fastboot menu" message): success. It prints the next step.
+- **Stock fastbootd** (the refusal lacks that text): the built ramdisk did not
+  replace the phone's.
+- **Android booted** (seen with `adb`): the bootloader started the image as a
+  normal boot, not recovery. In that case `fastboot boot` cannot reach the
+  patched fastbootd on komodo.
+- **Back in the bootloader**, or **nothing within `--wait` seconds** (default
+  180): the image did not come up. If the phone shows the recovery menu, pick
+  **Enter fastboot**.
+
+The probe is refused before anything is read, because reading starts disabled
+on every boot.
+
+### Not yet confirmed on komodo
+
+Two things can only be learned with the phone in hand:
+- whether komodo's bootloader starts a `fastboot boot` image in recovery mode,
+  where fastbootd runs;
+- whether the built kernel comes up with the dtb from the phone's own
+  vendor_boot. This is most likely when the phone already runs the same
+  GrapheneOS build.
+
+The command tells you which of these happened. Either way nothing is written,
+and a reboot (Power + Volume Down for the bootloader) undoes it.
+
+If `fastboot boot` cannot reach the patched fastbootd, the only alternative is
+flashing vendor_boot (e.g. on the inactive slot), which **writes to the phone**.
+komodo has no USB-boot rescue, so that decision and the go-ahead are yours. No
+script here flashes.
 
 ## Use it
 
