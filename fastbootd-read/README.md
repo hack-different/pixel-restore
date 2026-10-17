@@ -34,7 +34,8 @@ fastbootd-read/
   aosp-new/     the two new daemon source files, for reference
   docker/       Linux build environment (Dockerfile + build.sh) — macOS can't build AOSP
   scripts/      container-build (sync/vendor/patch/build), apply-patches,
-                verify image, read-partitions wrapper
+                verify image, make_ram_boot_image, boot-fastbootd (RAM boot),
+                read-partitions wrapper
   docs/         design.md (mechanism) and build-and-boot.md (how to build + boot)
 ```
 
@@ -46,8 +47,11 @@ fastbootd-read/
 #    komodo-cur-userdebug, verifies the patch is in the binary, and copies the
 #    images to fastbootd-read/out/komodo/. Re-runs are incremental.
 ./docker/build.sh
-# 2. Boot it temporarily on the unlocked phone (see docs/build-and-boot.md),
-#    pick "Enable reading" on the phone screen, then:
+# 2. Phone in the bootloader, unlocked: load the patched fastbootd into RAM
+#    (`fastboot boot`, never flashes). It checks the phone first and confirms
+#    which fastbootd came up. See docs/build-and-boot.md.
+./docker/build.sh boot
+# 3. On the phone's screen pick "Enable reading", then:
 ./scripts/read-partitions.sh --serial <serial> ~/pixel-partitions
 ```
 

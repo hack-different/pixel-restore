@@ -7,7 +7,8 @@
 #   /ccache     compiler cache
 #
 # Steps: repo init + sync -> adevtool vendor files -> apply patches -> build
-# -> verify the patch is in the binary -> copy images to /artifacts.
+# -> verify the patch is in the binary -> copy images to /artifacts
+# -> assemble fastbootd-boot.img (scripts/make_ram_boot_image.py).
 # Each step is safe to re-run. Nothing here talks to a phone.
 set -euo pipefail
 
@@ -24,6 +25,24 @@ PATCHES=/patches
 ART=/artifacts
 
 step() { echo; echo "==> $*"; }
+
+# adevtool refuses to run as root, and nothing else here needs root. Give the
+# tree and ccache to the image's unprivileged `node` user (uid 1000) once, then
+# run this script again as that user. CHOWN=1 repeats the ownership fix, e.g.
+# after running commands as root in `docker/build.sh shell`.
+BUILD_USER=node
+if [ "$(id -u)" = 0 ]; then
+  owned=/aosp/.fastbootd-read-owner
+  if [ "$(cat "$owned" 2>/dev/null)" != "$BUILD_USER" ] || [ "${CHOWN:-0}" = 1 ]; then
+    step "Giving /aosp and /ccache to $BUILD_USER (once; a synced tree takes a few minutes)"
+    chown -R "$BUILD_USER:$BUILD_USER" /aosp /ccache
+    echo "$BUILD_USER" > "$owned"
+    chown "$BUILD_USER:$BUILD_USER" "$owned"
+  fi
+  # A bind mount from macOS accepts writes from any uid; on Linux, own it.
+  chown "$BUILD_USER:$BUILD_USER" /artifacts 2>/dev/null || true
+  exec runuser -u "$BUILD_USER" -- env HOME="/home/$BUILD_USER" bash "$0" "$@"
+fi
 cd /aosp
 
 step "Checking resources"
@@ -91,13 +110,14 @@ step "lunch $LUNCH_TARGET"
 lunch "$LUNCH_TARGET" || exit 1
 
 step "Building fastbootd, recovery and the boot images"
-m fastbootd recovery bootimage vendorbootimage vendorkernelbootimage unpack_bootimg mkbootimg || exit 1
+m fastbootd recovery bootimage initbootimage vendorbootimage vendorkernelbootimage \
+  unpack_bootimg mkbootimg || exit 1
 
 step "Verifying the patch is in the built fastbootd"
 WORK="$ART/verify" "$PATCHES/scripts/make-boot-image.sh" || exit 1
 
 step "Copying images to the artifacts directory"
-for f in boot.img vendor_boot.img vendor_kernel_boot.img recovery.img; do
+for f in boot.img init_boot.img vendor_boot.img vendor_kernel_boot.img recovery.img; do
   if [ -f "$OUT/$f" ]; then cp -v "$OUT/$f" "$ART/"; fi
 done
 find "$OUT" -path "$OUT/obj" -prune -o -name fastbootd -type f -print \
@@ -105,7 +125,10 @@ find "$OUT" -path "$OUT/obj" -prune -o -name fastbootd -type f -print \
 repo manifest -r -o "$ART/manifest.xml" 2>/dev/null
 echo "$LUNCH_TARGET" > "$ART/lunch-target.txt"
 
+step "Assembling fastbootd-boot.img for a RAM-only \`fastboot boot\`"
+python3 -I "$PATCHES/scripts/make_ram_boot_image.py" "$ART" /aosp/system/tools/mkbootimg || exit 1
+
 echo
 echo ">> Done. Images are in the artifacts directory (docker/build.sh prints its host path)."
 echo "   manifest.xml pins the exact source revisions that were built."
-echo "   Booting them on the phone is a separate, manual step: docs/build-and-boot.md."
+echo "   To boot it on the phone from RAM (nothing is flashed): ./docker/build.sh boot"
