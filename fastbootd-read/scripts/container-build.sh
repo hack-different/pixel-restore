@@ -45,6 +45,12 @@ if [ "$(id -u)" = 0 ]; then
 fi
 cd /aosp
 
+# repo reads only the user's own ~/.gitconfig (not the image's system config)
+# and asks interactively for anything missing there, which hangs the build.
+git config --global --get color.ui >/dev/null || git config --global color.ui false
+git config --global --get user.name >/dev/null || git config --global user.name "fastbootd-read builder"
+git config --global --get user.email >/dev/null || git config --global user.email "builder@localhost"
+
 step "Checking resources"
 free_gb=$(df -Pk /aosp | awk 'NR==2 {print int($4 / 1048576)}')
 mem_gb=$(awk '/MemTotal/ {print int($2 / 1048576)}' /proc/meminfo)
