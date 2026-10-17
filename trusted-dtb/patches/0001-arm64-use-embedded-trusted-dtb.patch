@@ -1,0 +1,181 @@
+From: Pixel Restore
+Subject: [PATCH] arm64: optionally use an embedded trusted DTB for topology
+
+Komodo's forensic use case requires that we not trust the device tree the
+bootloader hands over in x0: it may omit controllers or over-reserve memory.
+When CONFIG_PIXEL_TRUSTED_DTB is set we link a known-good DTB into the kernel
+image and make it the live device tree that drivers bind against, while still
+taking the facts we genuinely cannot know ahead of boot from the bootloader's
+tree:
+
+  - RAM size: early_init_dt_scan() populates memblock from the bootloader DT
+    at line 306 (before the swap), so the real memory map is already in place.
+  - /chosen: copied verbatim from the bootloader DT into our blob, so the
+    resolved bootargs, bootconfig, initrd range, kaslr-seed and rng-seed
+    survive into the unflattened tree.
+
+The swap happens before arm64_memblock_init(), so /reserved-memory is scanned
+from OUR tree -- that is the point: we decide what Linux may map.
+
+ACK android14-6.1 caveat: this seam is correct only while
+early_init_fdt_scan_reserved_mem() is still called from inside
+arm64_memblock_init(). Google occasionally reorders this; if it runs before
+our swap, reserved-memory would come from the bootloader tree and the swap
+must move earlier to match. Verify before relying on the reserved-memory
+override.
+
+This is a NON-UPSTREAM patch for a controlled investigation. It does not
+change behaviour unless CONFIG_PIXEL_TRUSTED_DTB=y. Line numbers below match
+torvalds v6.1; adjust context for the ACK android14-6.1 tree.
+
+NOTE: this is a reviewed starting point, not yet built. The embedded blob is
+emitted by tools/build_trusted_dtb.sh as pixel-trusted.dtb; drop it where the
+.incbin path below expects it (arch/arm64/boot/) or adjust the path.
+
+---
+ arch/arm64/Kconfig                 | 13 ++++++++
+ arch/arm64/kernel/Makefile         |  4 +++
+ arch/arm64/kernel/pixel_dtb.S      |  9 +++++
+ arch/arm64/kernel/pixel_dtb.c      | 71 ++++++++++++++++++++++++++++++++++++++
+ arch/arm64/kernel/setup.c          |  5 +++
+ 5 files changed, 102 insertions(+)
+ create mode 100644 arch/arm64/kernel/pixel_dtb.S
+ create mode 100644 arch/arm64/kernel/pixel_dtb.c
+
+diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -0,0 +0,0 @@ config ARM64
++config PIXEL_TRUSTED_DTB
++	bool "Use an embedded trusted device tree instead of the bootloader's"
++	default n
++	help
++	  When enabled, the kernel links a device tree blob built from trusted
++	  SoC sources into its image and uses it as the live device tree that
++	  drivers bind against, instead of the one the bootloader passes in x0.
++	  The bootloader tree is still consulted for the memory map and for the
++	  /chosen node (bootargs, bootconfig, initrd, seeds).
++
++	  This is for controlled forensic / bring-up work where the on-device
++	  tree cannot be trusted. Say N for a normal build.
+
+diff --git a/arch/arm64/kernel/Makefile b/arch/arm64/kernel/Makefile
+--- a/arch/arm64/kernel/Makefile
++++ b/arch/arm64/kernel/Makefile
+@@ -0,0 +0,0 @@ obj-y			:= ...
++obj-$(CONFIG_PIXEL_TRUSTED_DTB)	+= pixel_dtb.o pixel_dtb_blob.o
++# pixel_dtb_blob.o is assembled from pixel_dtb.S which .incbin's the DTB.
+
+diff --git a/arch/arm64/kernel/pixel_dtb.S b/arch/arm64/kernel/pixel_dtb.S
+new file mode 100644
+--- /dev/null
++++ b/arch/arm64/kernel/pixel_dtb.S
+@@ -0,0 +0,0 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++	.section .init.rodata, "a"
++	.align 3			/* DTB must be 8-byte aligned */
++	.globl pixel_trusted_dtb_begin
++pixel_trusted_dtb_begin:
++	.incbin "arch/arm64/boot/pixel-trusted.dtb"
++	.globl pixel_trusted_dtb_end
++pixel_trusted_dtb_end:
+
+diff --git a/arch/arm64/kernel/pixel_dtb.c b/arch/arm64/kernel/pixel_dtb.c
+new file mode 100644
+--- /dev/null
++++ b/arch/arm64/kernel/pixel_dtb.c
+@@ -0,0 +0,0 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Replace the bootloader-supplied device tree with an embedded trusted one,
++ * keeping only the dynamic /chosen facts from the bootloader tree.
++ */
++#include <linux/init.h>
++#include <linux/libfdt.h>
++#include <linux/of_fdt.h>
++#include <linux/printk.h>
++#include <linux/string.h>
++
++extern char pixel_trusted_dtb_begin[];
++extern char pixel_trusted_dtb_end[];
++
++/* Scratch copy we can mutate; the .incbin'd blob is in .init.rodata.
++ * Sized generously; a komodo DTB is well under this. */
++static char pixel_dtb_work[512 * 1024] __initdata __aligned(8);
++
++/*
++ * Graft the bootloader's /chosen node (resolved bootargs, bootconfig, initrd
++ * range, kaslr-seed, rng-seed, androidboot.*) into our trusted blob, then
++ * return a pointer to the grafted blob. Called AFTER setup_machine_fdt() has
++ * scanned the bootloader tree (so memblock has the real memory map) and
++ * BEFORE arm64_memblock_init() (so /reserved-memory is read from ours).
++ *
++ * @bl_fdt: the bootloader DTB (current initial_boot_params).
++ * Returns the trusted blob to install as initial_boot_params, or NULL to
++ * leave the bootloader tree in place (fail safe).
++ */
++void * __init pixel_trusted_fdt(const void *bl_fdt)
++{
++	size_t size = pixel_trusted_dtb_end - pixel_trusted_dtb_begin;
++	int bl_chosen, our_chosen, rc, prop;
++
++	if (size > sizeof(pixel_dtb_work)) {
++		pr_crit("pixel-dtb: embedded blob too large (%zu)\n", size);
++		return NULL;
++	}
++	memcpy(pixel_dtb_work, pixel_trusted_dtb_begin, size);
++	if (fdt_check_header(pixel_dtb_work)) {
++		pr_crit("pixel-dtb: embedded blob has bad header\n");
++		return NULL;
++	}
++	/* room to splice /chosen */
++	if (fdt_open_into(pixel_dtb_work, pixel_dtb_work, sizeof(pixel_dtb_work)))
++		return NULL;
++
++	bl_chosen = fdt_path_offset(bl_fdt, "/chosen");
++	if (bl_chosen < 0) {
++		pr_warn("pixel-dtb: bootloader tree has no /chosen; keeping ours\n");
++		goto done;
++	}
++	/* drop our placeholder /chosen, recreate it, copy every property */
++	our_chosen = fdt_path_offset(pixel_dtb_work, "/chosen");
++	if (our_chosen >= 0)
++		fdt_del_node(pixel_dtb_work, our_chosen);
++	our_chosen = fdt_add_subnode(pixel_dtb_work, 0, "chosen");
++	if (our_chosen < 0)
++		return NULL;
++	fdt_for_each_property_offset(prop, bl_fdt, bl_chosen) {
++		const char *name;
++		int len;
++		const void *val = fdt_getprop_by_offset(bl_fdt, prop, &name, &len);
++
++		if (!val)
++			continue;
++		rc = fdt_setprop(pixel_dtb_work, our_chosen, name, val, len);
++		if (rc) {
++			pr_crit("pixel-dtb: /chosen copy failed (%s): %d\n", name, rc);
++			return NULL;
++		}
++	}
++done:
++	fdt_pack(pixel_dtb_work);
++	pr_info("pixel-dtb: using embedded trusted device tree\n");
++	return pixel_dtb_work;
++}
+
+diff --git a/arch/arm64/kernel/setup.c b/arch/arm64/kernel/setup.c
+--- a/arch/arm64/kernel/setup.c
++++ b/arch/arm64/kernel/setup.c
+@@ -306,6 +306,11 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
+ 	setup_machine_fdt(__fdt_pointer);
+
++#ifdef CONFIG_PIXEL_TRUSTED_DTB
++	/* Swap to our trusted tree before reserved-memory is scanned. */
++	{ void *t = pixel_trusted_fdt(initial_boot_params);
++	  if (t) initial_boot_params = t; }
++#endif
++
+ 	/*
+ 	 * Initialise the static keys early as they may be enabled by the
+ 	 * cpufeature code and early parameters.
+--
