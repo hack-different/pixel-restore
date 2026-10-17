@@ -88,6 +88,30 @@ pixel-restore boot --image X --stage dpm=my-dpm.img   # override one partition
 pixel-restore boot --image X --map NEWSTAGE=gsa       # teach it an unfamiliar request
 ```
 
+## Repairing the modem (blank IMEI, no baseband)
+
+If the phone boots but shows no IMEI, "Unknown" baseband or no signal after a
+flash, the usual cause is a radio image from a different build than the
+bootloader, or a damaged modem partition. The IMEI itself lives in the
+phone's `efs`/`persist` data, which factory images never touch, so it is
+normally still there. With the phone in fastboot and the bootloader unlocked:
+
+```sh
+pixel-restore repair-modem --image komodo-xxxx-factory-xxxx.zip   # radio from the same build as the bootloader
+pixel-restore repair-modem --device komodo --build cp3a.260905.009  # fetch just radio-*.img for that build
+pixel-restore repair-modem --image radio-komodo-xxxx.img --dry-run  # show what it would do
+pixel-restore repair-modem --restore efs=efs.img --restore persist=persist.img   # this phone's own backups
+```
+
+It prints the phone's product, bootloader and baseband, refuses a radio
+built for another model, warns when the ZIP's bootloader differs from the
+one on the phone, asks before flashing (`--yes` skips that), flashes `radio`,
+reboots into the bootloader and reads the baseband back. `--restore` only
+writes `efs`, `efs_backup`, `modem_userdata` and `persist`, and only makes
+sense with images taken from the same phone. `--serial` is needed only when
+more than one phone is in fastboot; `$FASTBOOT` points it at a specific
+`fastboot` binary.
+
 ## How the protocol works
 
 Device → host is text, one message per line:

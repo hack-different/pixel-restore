@@ -318,34 +318,38 @@ impl RangeSource for HttpRange {
 
 /// Download only `bootloader-*.img` from a factory ZIP into `out_dir`.
 pub fn fetch_bootloader(image: &Image, out_dir: &Path) -> Result<PathBuf> {
+    fetch_member(image, out_dir, "bootloader")
+}
+
+/// Download only `radio-*.img` (the modem firmware) from a factory ZIP.
+pub fn fetch_radio(image: &Image, out_dir: &Path) -> Result<PathBuf> {
+    fetch_member(image, out_dir, "radio")
+}
+
+/// Download the top-level `<prefix>*.img` from a factory ZIP into `out_dir`,
+/// reading only the ZIP's directory and that one member.
+fn fetch_member(image: &Image, out_dir: &Path, prefix: &str) -> Result<PathBuf> {
     let mut src = HttpRange::open(&image.url)?;
     eprintln!(
-        "{} is {:.2} GB; reading just its directory and bootloader ...",
+        "{} is {:.2} GB; reading just its directory and {prefix} image ...",
         image.file_name(),
         src.len() as f64 / 1e9
     );
     let members = remotezip::list(&mut src)?;
-    let member = members
-        .iter()
-        .find(|m| {
-            let base = m.name.rsplit('/').next().unwrap_or(&m.name);
-            base.starts_with("bootloader") && base.ends_with(".img")
-        })
-        .ok_or_else(|| {
-            anyhow!(
-                "no bootloader-*.img inside {} (members: {})",
-                image.file_name(),
-                members
-                    .iter()
-                    .map(|m| m.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        })?;
+    let member = remotezip::find_image(&members, prefix).ok_or_else(|| {
+        anyhow!(
+            "no {prefix}-*.img inside {} (members: {})",
+            image.file_name(),
+            members
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
     let data = remotezip::extract(&mut src, member)?;
     std::fs::create_dir_all(out_dir)?;
-    let base = member.name.rsplit('/').next().unwrap_or(&member.name);
-    let path = out_dir.join(base);
+    let path = out_dir.join(member.base_name());
     std::fs::write(&path, &data).with_context(|| format!("writing {}", path.display()))?;
     eprintln!(
         "wrote {} ({} bytes, {} bytes transferred)",

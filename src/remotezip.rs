@@ -25,6 +25,55 @@ pub struct Member {
     pub local_header_offset: u64,
 }
 
+impl Member {
+    /// The file name without any directory, e.g. `radio-komodo-g5400c.img`.
+    pub fn base_name(&self) -> &str {
+        self.name.rsplit('/').next().unwrap_or(&self.name)
+    }
+}
+
+/// The `<prefix>-*.img` member, as factory ZIPs name `bootloader-*.img` and
+/// `radio-*.img`.
+pub fn find_image<'a>(members: &'a [Member], prefix: &str) -> Option<&'a Member> {
+    members.iter().find(|m| {
+        let base = m.base_name();
+        base.starts_with(prefix) && base.ends_with(".img")
+    })
+}
+
+/// Byte ranges of a file on disk, so a local 4 GB factory ZIP is not read
+/// into memory to get one image out of it.
+pub struct FileRange {
+    file: std::fs::File,
+    len: u64,
+}
+
+impl FileRange {
+    pub fn open(path: &std::path::Path) -> Result<FileRange> {
+        let file =
+            std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let len = file.metadata()?.len();
+        Ok(FileRange { file, len })
+    }
+}
+
+impl RangeSource for FileRange {
+    fn len(&self) -> u64 {
+        self.len
+    }
+    fn read_range(&mut self, start: u64, end: u64) -> Result<Vec<u8>> {
+        use std::io::{Seek, SeekFrom};
+        ensure!(
+            end <= self.len && start <= end,
+            "range {start}..{end} out of bounds"
+        );
+        self.file.seek(SeekFrom::Start(start))?;
+        let mut buf = vec![0; (end - start) as usize];
+        self.file.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+}
+
 const EOCD_SIG: u32 = 0x0605_4b50;
 const EOCD64_LOCATOR_SIG: u32 = 0x0706_4b50;
 const EOCD64_SIG: u32 = 0x0606_4b50;
