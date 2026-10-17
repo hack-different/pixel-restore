@@ -361,3 +361,28 @@ This sends exact `STAGE.bin` payloads using the current DNW transport. It does n
 run the prototype's XMODEM implementation. See the
 [migration guide](docs/tensor-migration.md) for file layout, CLI differences,
 and validation limits. Development belongs in `hack-different/pixel-restore`.
+
+## Gathering GSC (Titan M / M2) firmware across releases
+
+`tools/pixel_gsc_fetch.py` indexes every factory image Google lists and pulls
+the Titan firmware files (`*.rec`, `*.bin`) out of each one with HTTP byte-range
+reads, the way `partialzip` does, so no image is downloaded whole. It needs
+only Python 3.9 and reaches `developers.google.com` and `dl.google.com`
+directly, so run it from a machine with ordinary internet access.
+
+```sh
+# 1. every factory image URL, SHA-256 and description, keyed by codename
+python3 tools/pixel_gsc_fetch.py index --out firmware-index.json
+# 2. what one image holds and where its GSC files are, for a few hundred KB
+python3 tools/pixel_gsc_fetch.py list https://dl.google.com/dl/android/aosp/komodo-cp3a.260905.009-factory-99eb621a.zip
+# 3. walk the index and collect <codename>/<build>/... plus manifest.json
+python3 tools/pixel_gsc_fetch.py fetch --index firmware-index.json --out gsc-firmware --device komodo --limit 3
+```
+
+`fetch` reads the top-level members, the `image-*.zip` inside (in place when it
+is stored, or streamed through with `--stream-nested` when it is deflated) and
+the FBPK partitions of `bootloader-*.img` / `radio-*.img`. It skips
+carrier-specific builds unless `--carriers` is given, resumes from
+`manifest.json`, and uses a `partialzip` binary on PATH for the ZIP reads when
+one is installed (`--backend builtin` to never use it). Firmware that only
+ships inside `vendor.img` is not reached yet; the manifest says so per image.
