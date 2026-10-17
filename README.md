@@ -163,18 +163,27 @@ ZIPs are cached in `~/Library/Caches/pixel-restore/images/` (or
 
 ```sh
 pixel-restore fastbootd --dry-run      # checks only: unlocked, in the bootloader, image fits
-pixel-restore fastbootd                # fastboot boot fastbootd-read/out/<product>/fastbootd-boot.img
-pixel-restore fastbootd --image X.img --serial S --wait 300
+pixel-restore fastbootd                # boot the built ramdisks with the phone's own kernel
+pixel-restore fastbootd --kernel built # fastbootd-read/out/<product>/fastbootd-boot.img as built
+pixel-restore fastbootd --kernel boot.img   # another build's kernel (e.g. the phone's factory image)
+pixel-restore fastbootd --dmesg        # save and summarize `fastboot oem dmesg`
 ```
 
-From the bootloader (not fastbootd), `fastbootd` sends one
-`fastboot boot` of the image that `fastbootd-read/docker/build.sh` builds,
-then waits for the phone to come back and tells you what it came back as:
-the patched fastbootd (its `fetch` refusal names the on-screen menu), the
-stock one, Android, or the bootloader again. Nothing is flashed, and a
-reboot returns the phone to what is installed. It refuses a locked phone,
-an image built for another product, and one bigger than
-`max-download-size`. See `fastbootd-read/docs/build-and-boot.md`.
+From the bootloader (not fastbootd), `fastbootd` sends one `fastboot boot`
+and then tells you what the phone came back as: the patched fastbootd (its
+`fetch` refusal names the on-screen menu), the stock one, Android, or the
+bootloader again. Nothing is flashed, and a reboot returns the phone to what
+is installed. It refuses a locked phone, an image built for another
+product, and one bigger than `max-download-size`.
+
+The bootloader boots the image's kernel with the phone's own
+vendor_kernel_boot (device tree and modules), so a kernel from another build
+panics on mismatched modules and the phone drops back to the bootloader. So
+by default it reads the phone's `boot_<slot>` with `fastboot fetch` (read
+only) and rebuilds the image from that kernel plus the built vendor_boot and
+init_boot ramdisks. When an image drops back to the bootloader, it saves
+`fastboot oem dmesg` next to the image and prints the reboot reason and the
+last errors. See `fastbootd-read/docs/build-and-boot.md`.
 
 ### Other commands
 
