@@ -385,4 +385,16 @@ the FBPK partitions of `bootloader-*.img` / `radio-*.img`. It skips
 carrier-specific builds unless `--carriers` is given, resumes from
 `manifest.json`, and uses a `partialzip` binary on PATH for the ZIP reads when
 one is installed (`--backend builtin` to never use it). Firmware that only
-ships inside `vendor.img` is not reached yet; the manifest says so per image.
+ships inside `vendor.img` (the Pixel 3-5 Citadel `ec.bin` / `ec.rec`) needs
+`--kinds vendor`, which streams the image through `tools/android_fs.py`.
+
+Every blob is hashed with SHA-256 and a repeat across releases is hard-linked,
+so the per-release folders cost no extra disk. To keep only one file per
+distinct `.rec` / `.bin` / `.img`:
+
+```sh
+# 4. unique/<kind>/<sha256-prefix>-<name> plus unique/index.json listing the releases that share each
+python3 tools/pixel_gsc_fetch.py unique --out gsc-firmware --prune   # --prune drops the per-release copies
+# 5. group by chip / flavor and decode headers (versions, build tags, FBPK partitions) into report.json
+python3 tools/pixel_gsc_fetch.py report --out gsc-firmware --devices data/device-index.json
+```

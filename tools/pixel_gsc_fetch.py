@@ -816,6 +816,61 @@ def cmd_report(args):
     log(f"wrote {out / 'report.json'}: {len(blobs)} distinct blobs in {len(groups)} groups")
 
 
+def cmd_unique(args):
+    """Keep one copy of every distinct .rec / .bin / .img `fetch` gathered:
+    <out>/unique/<kind>/<sha256-prefix>-<name>, hard-linked to (or copied
+    from) the first release that carried it, with unique/index.json saying
+    which releases share each blob. `--prune` then removes the per-release
+    copies so only the unique files and the JSON records remain."""
+    out = Path(args.out)
+    manifest = json.loads((out / "manifest.json").read_text())
+    udir = out / "unique"
+    blobs = {}
+    for e in manifest["images"].values():
+        for f in e.get("files", []):
+            b = blobs.setdefault(f["sha256"], {"sha256": f["sha256"], "kind": f["kind"], "size": f["size"],
+                                               "name": f["path"].rsplit("/", 1)[-1], "releases": []})
+            b["releases"].append({"codename": e["codename"], "build": e["build"],
+                                  "description": e["description"], "path": f["path"]})
+    kept = missing = 0
+    for sha, b in blobs.items():
+        rel = Path("unique") / b["kind"] / f"{sha[:16]}-{b['name']}"
+        dest = out / rel
+        b["path"] = rel.as_posix()
+        if not dest.is_file():
+            src = next((out / r["path"] for r in b["releases"] if (out / r["path"]).is_file()), None)
+            if src is None:
+                b["missing"] = True
+                missing += 1
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.link(src, dest)
+            except OSError:
+                shutil.copyfile(src, dest)
+        kept += 1
+        b["codenames"] = sorted({r["codename"] for r in b["releases"]})
+    index = {"generated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+             "blobs": sorted(blobs.values(), key=lambda b: (b["kind"], b["name"], b["sha256"]))}
+    udir.mkdir(parents=True, exist_ok=True)
+    (udir / "index.json").write_text(json.dumps(index, indent=2) + "\n")
+    log(f"{kept} unique blobs under {udir} ({missing} not on disk)")
+    if args.prune:
+        removed = 0
+        for b in blobs.values():
+            if b.get("missing"):
+                continue
+            for r in b["releases"]:
+                p = out / r["path"]
+                if p.is_file():
+                    p.unlink()
+                    removed += 1
+        for d in sorted((p for p in out.rglob("*") if p.is_dir() and not p.is_relative_to(udir)), reverse=True):
+            if not any(d.iterdir()):
+                d.rmdir()
+        log(f"pruned {removed} per-release copies; the <codename>/<build>.json records still name them")
+
+
 def cmd_fetch(args):
     doc = json.loads(Path(args.index).read_text())
     by = doc["by_codename"]
@@ -985,6 +1040,10 @@ def main(argv=None):
     f.add_argument("--backend", choices=("auto", "builtin", "partialzip"), default="auto")
     f.add_argument("--partialzip", help="path to the partialzip binary")
     f.set_defaults(func=cmd_fetch)
+    u = sub.add_parser("unique", help="keep one copy of each distinct .rec/.bin/.img under <out>/unique/<kind>/")
+    u.add_argument("--out", required=True, help="the fetch output folder (holds manifest.json)")
+    u.add_argument("--prune", action="store_true", help="remove the per-release copies afterwards")
+    u.set_defaults(func=cmd_unique)
     args = p.parse_args(argv)
     args.func(args)
 

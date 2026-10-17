@@ -325,6 +325,20 @@ class HttpTests(unittest.TestCase):
             self.assertEqual(len(bl[0]["releases"]), 2)
             # The carrier build 404s on the test server and is recorded as an error.
             self.assertIn("error", man["images"]["komodo-cp3a.260905.009.v1-factory-deadbeef.zip"])
+            # `unique` keeps one file per SHA-256 and `--prune` drops the per-release copies.
+            g.main(["unique", "--out", str(out)])
+            uidx = json.loads((out / "unique/index.json").read_text())
+            self.assertEqual(len(uidx["blobs"]), rep["distinct_blobs"])
+            ubl = next(b for b in uidx["blobs"] if b["kind"] == "bootloader")
+            self.assertEqual(ubl["path"], f"unique/bootloader/{ubl['sha256'][:16]}-bootloader-komodo-ripcurrent-1.img")
+            self.assertEqual((out / ubl["path"]).read_bytes(), BL)
+            self.assertEqual(len(ubl["releases"]), 2)
+            g.main(["unique", "--out", str(out), "--prune"])
+            self.assertFalse((out / same[0]["path"]).exists())
+            self.assertFalse((out / "komodo/cp3a.260905.009").exists())
+            self.assertTrue((out / "komodo/cp3a.260905.009.json").is_file())
+            self.assertEqual((out / ubl["path"]).read_bytes(), BL)
+            self.assertEqual(len(list((out / "unique").rglob("*-*"))), rep["distinct_blobs"])
 
 
 @unittest.skipUnless(shutil.which("mke2fs"), "mke2fs not installed")
