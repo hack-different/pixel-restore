@@ -28,6 +28,11 @@ pub struct TitanArgs {
     #[arg(long, short)]
     firmware: Option<PathBuf>,
 
+    /// Decode the Titan M headers and build tags in this .bin or .rec and
+    /// stop; needs no phone.
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["firmware", "build", "apply"])]
+    inspect: Option<PathBuf>,
+
     /// Instead of --firmware, look in this build's factory image for the
     /// phone (downloaded and cached as `restore` does). Default: the newest.
     #[arg(long, short, conflicts_with = "firmware")]
@@ -57,6 +62,24 @@ pub struct TitanArgs {
     /// Allow an image with a higher rollback level than the chip; one-way.
     #[arg(long)]
     allow_rollback_bump: bool,
+
+    /// Allow an image signed with a key the chip's RW images do not use.
+    /// The chip decides which keys it accepts; one it rejects leaves that
+    /// RW slot unbootable until rescued again.
+    #[arg(long)]
+    allow_other_key: bool,
+
+    /// Read the chip's signing key ids and report them, without sending
+    /// anything. With --expect-keyid or --firmware it also checks the chip's
+    /// RW key against that expected value and fails on a mismatch.
+    #[arg(long, conflicts_with_all = ["inspect", "apply"])]
+    verify_keys: bool,
+
+    /// Expected RW signing key id (8 hex digits), repeatable. Used by
+    /// --verify-keys; the check passes only if every RW image on the chip is
+    /// signed with one of these.
+    #[arg(long, value_name = "HEX")]
+    expect_keyid: Vec<String>,
 }
 
 /// The images `oem gsc header` describes.
@@ -90,6 +113,40 @@ pub fn chip_name(flavor: &str) -> &'static str {
         Some('d') => "Titan M2 (Dauntless)",
         _ => "unknown Titan M",
     }
+}
+
+/// Cr50's G_SIGNED_FOR_PROD convention: a production key's id has bit D2 set,
+/// a development key's does not. Enforced at Google's key-generation time;
+/// inferred to hold for the Titan M2, not documented.
+pub fn prod_by_rule(keyid: u32) -> bool {
+    keyid & 4 != 0
+}
+
+/// Titan M signing key ids we have seen on genuine hardware, so a verify can
+/// say more than dev-or-prod. Observed, not an authoritative Google list; add
+/// to it as real factory images and phones are read.
+pub const KNOWN_KEYIDS: &[(u32, &str)] = &[
+    (0x68f3_79bd, "komodo RW (observed 2026-10-17)"),
+    (0x894b_7d29, "komodo RO (observed 2026-10-17)"),
+];
+
+/// A one-line note on a key id: the dev/prod rule and any known match.
+pub fn keyid_note(keyid: u32) -> String {
+    let rule = if prod_by_rule(keyid) {
+        "production by Cr50 rule"
+    } else {
+        "development by Cr50 rule"
+    };
+    match KNOWN_KEYIDS.iter().find(|(k, _)| *k == keyid) {
+        Some((_, label)) => format!("{rule}; known: {label}"),
+        None => format!("{rule}; not in the known-key table"),
+    }
+}
+
+fn parse_keyid(text: &str) -> Result<u32> {
+    let t = text.trim();
+    let t = t.strip_prefix("0x").unwrap_or(t);
+    u32::from_str_radix(t, 16).with_context(|| format!("'{text}' is not an 8-hex-digit key id"))
 }
 
 /// `(bootloader) name: value` (or `name=value`) lines of an oem reply.
@@ -246,6 +303,91 @@ pub fn signed_headers(data: &[u8]) -> Vec<Header> {
     out
 }
 
+/// The SignedHeader fields worth comparing, in the form `field_text` gives
+/// the chip's: hex words as 8 digits, versions and the build time in decimal.
+pub fn header_fields(data: &[u8], off: usize) -> Vec<(&'static str, String)> {
+    let w = |o: usize| u32_at(data, off + o);
+    let words = |o: usize| {
+        (0..4)
+            .map(|i| format!("{:08x}", w(o + 4 * i)))
+            .collect::<String>()
+    };
+    let timestamp = u64::from_le_bytes(data[off + 872..off + 880].try_into().unwrap());
+    vec![
+        ("magic", format!("{:08x}", w(0))),
+        ("keyid", format!("{:08x}", w(KEYID))),
+        ("img_size", format!("{:#x}", w(IMAGE_SIZE))),
+        ("ro_base", format!("{:#010x}", w(RO_BASE))),
+        ("ro_max", format!("{:#010x}", w(RO_MAX))),
+        ("rx_base", format!("{:#010x}", w(820))),
+        ("rx_max", format!("{:#010x}", w(824))),
+        ("fusemap", words(828)),
+        ("infomap", words(INFOMAP)),
+        ("epoch", w(EPOCH).to_string()),
+        ("major", w(EPOCH + 4).to_string()),
+        ("minor", w(EPOCH + 8).to_string()),
+        ("timestamp", timestamp.to_string()),
+        (
+            "board_id",
+            format!("{:08x} {:08x} {:08x}", w(996), w(1000), w(1004)),
+        ),
+    ]
+}
+
+/// A chip header value in `header_fields` form, so the two compare as text.
+pub fn field_text(name: &str, raw: &str) -> String {
+    let hex = |v: &str| {
+        let v = v.trim();
+        let v = v.strip_prefix("0x").unwrap_or(v);
+        let d: String = v.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+        u64::from_str_radix(&d, 16).ok()
+    };
+    let shown = match name {
+        "fusemap" | "infomap" => Some(
+            raw.chars()
+                .filter(|c| c.is_ascii_hexdigit())
+                .collect::<String>()
+                .to_ascii_lowercase(),
+        ),
+        "magic" | "keyid" => hex(raw).map(|v| format!("{v:08x}")),
+        "img_size" => hex(raw).map(|v| format!("{v:#x}")),
+        "ro_base" | "ro_max" | "rx_base" | "rx_max" => hex(raw).map(|v| format!("{v:#010x}")),
+        "epoch" | "major" | "minor" | "timestamp" => hex(raw).map(|v| v.to_string()),
+        "board_id" => Some(
+            raw.split_whitespace()
+                .filter_map(hex)
+                .map(|v| format!("{v:08x}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        _ => None,
+    };
+    shown.unwrap_or_else(|| raw.trim().to_string())
+}
+
+/// (field, chip value, image value).
+pub type FieldDiff = (String, String, String);
+
+/// Field by field, a header in the image against the chip's image at the
+/// same address: (chip image, [(field, chip value, file value)]) for the
+/// fields that differ, or None when no chip image sits at that address.
+pub fn header_delta(
+    chip: &[ChipHeader],
+    data: &[u8],
+    h: &Header,
+) -> Option<(String, Vec<FieldDiff>)> {
+    let ours = chip.iter().find(|c| c.ro_base == Some(h.ro_base))?;
+    let diffs = header_fields(data, h.offset)
+        .into_iter()
+        .filter_map(|(name, file)| {
+            let raw = ours.raw.iter().find(|(k, _)| k == name)?;
+            let chip = field_text(name, &raw.1);
+            (chip != file).then(|| (name.to_string(), chip, file))
+        })
+        .collect();
+    Some((ours.name.to_ascii_uppercase(), diffs))
+}
+
 /// One image's `oem gsc header` (`hdr.<field>: <hex>`), the fields the
 /// checks need.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -255,6 +397,8 @@ pub struct ChipHeader {
     pub version: Option<Version>,
     pub rollback_level: Option<u32>,
     pub keyid: Option<u32>,
+    /// Every field as the bootloader printed it, `hdr.` dropped.
+    pub raw: Vec<(String, String)>,
 }
 
 fn leading_hex(v: &str) -> Option<u32> {
@@ -271,7 +415,9 @@ pub fn parse_chip_header(name: &str, text: &str) -> ChipHeader {
     };
     let (mut e, mut ma, mut mi) = (None, None, None);
     for (k, v) in fields(text) {
-        match k.strip_prefix("hdr.").unwrap_or(&k) {
+        let k = k.strip_prefix("hdr.").unwrap_or(&k).to_string();
+        h.raw.push((k.clone(), v.clone()));
+        match k.as_str() {
             "ro_base" => h.ro_base = leading_hex(&v),
             "keyid" => h.keyid = leading_hex(&v),
             "epoch" => e = leading_hex(&v),
@@ -350,6 +496,7 @@ pub fn header_check(
     image: &[Header],
     allow_bump: bool,
     allow_downgrade: bool,
+    allow_other_key: bool,
 ) -> Result<(Version, u32)> {
     let rw: Vec<(Version, u32)> = chip
         .iter()
@@ -387,9 +534,9 @@ pub fn header_check(
         .collect();
     for h in checked {
         ensure!(
-            keys.is_empty() || keys.contains(&h.keyid),
+            keys.is_empty() || keys.contains(&h.keyid) || allow_other_key,
             "header at {:#x} is signed with key {:08x}, but the chip's RW images use {}; \
-             the chip would reject it",
+             the chip may reject it. Pass --allow-other-key to send it anyway",
             h.offset,
             h.keyid,
             keys.iter()
@@ -694,7 +841,166 @@ fn private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `--inspect`: everything the image says about itself.
+fn inspect(path: &Path) -> Result<()> {
+    let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let body = rescue_payload(&data)?;
+    println!("{} ({} bytes)", path.display(), data.len());
+    if body.len() != data.len() {
+        println!("  Intel HEX, {} bytes of data", body.len());
+    }
+    for b in image_builds(&body) {
+        println!("  carries {}", b.tag);
+    }
+    let headers = signed_headers(&body);
+    ensure!(
+        !headers.is_empty(),
+        "no Titan M signed header in {}",
+        path.display()
+    );
+    for h in &headers {
+        println!(
+            "  header at {:#x}, rollback level {}:",
+            h.offset, h.rollback_level
+        );
+        for (field, value) in header_fields(&body, h.offset) {
+            println!("    {field}: {value}");
+        }
+    }
+    Ok(())
+}
+
+/// The report `--verify-keys` prints: a line per chip image, and whether the
+/// RW keys match the expected set. `expected` empty means report only.
+pub fn verify_keys(chip: &[ChipHeader], expected: &[u32]) -> (Vec<String>, bool) {
+    let mut lines = Vec::new();
+    let mut rw_keys = Vec::new();
+    for h in chip {
+        match h.keyid {
+            Some(k) => {
+                lines.push(format!(
+                    "  {}: key {:08x} ({})",
+                    h.name.to_ascii_uppercase(),
+                    k,
+                    keyid_note(k)
+                ));
+                if h.name.starts_with("rw") {
+                    rw_keys.push(k);
+                }
+            }
+            None => lines.push(format!(
+                "  {}: no key id reported",
+                h.name.to_ascii_uppercase()
+            )),
+        }
+    }
+    // A dev-keyed RO under a prod-keyed RW is the oddity worth calling out.
+    if chip
+        .iter()
+        .any(|h| h.name.starts_with("ro") && h.keyid.is_some_and(|k| !prod_by_rule(k)))
+        && rw_keys.iter().any(|k| prod_by_rule(*k))
+    {
+        lines.push("  note: RO is development-keyed while RW is production-keyed".into());
+    }
+    if expected.is_empty() {
+        lines.push("  no expected key given (--expect-keyid or --firmware); reporting only".into());
+        return (lines, true);
+    }
+    let want = expected
+        .iter()
+        .map(|k| format!("{k:08x}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let ok = !rw_keys.is_empty() && rw_keys.iter().all(|k| expected.contains(k));
+    lines.push(if rw_keys.is_empty() {
+        format!("  MISMATCH: the chip reported no RW key to check against expected {want}")
+    } else if ok {
+        format!("  OK: every RW key matches expected {want}")
+    } else {
+        let got = rw_keys
+            .iter()
+            .map(|k| format!("{k:08x}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("  MISMATCH: chip RW keys {got}, expected {want}")
+    });
+    (lines, ok)
+}
+
+/// `--verify-keys`: read the chip's keys and check them against what's
+/// expected. Expected comes from --expect-keyid, or the RW key of a genuine
+/// image passed with --firmware. Read-only.
+fn run_verify_keys(a: &TitanArgs) -> Result<()> {
+    let phone = fastboot::Device::open(a.serial.as_deref())?;
+    let product = phone.getvar("product")?.unwrap_or_else(|| "?".into());
+    let flavor = phone
+        .getvar("gsc-flavor")?
+        .filter(|f| {
+            !f.is_empty()
+                && f.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        })
+        .context(
+            "the bootloader reports no usable gsc-flavor; is this a Titan M phone in fastboot?",
+        )?;
+    println!(
+        "{}: {product}, {} ({flavor})",
+        phone.serial,
+        chip_name(&flavor)
+    );
+
+    let chip: Vec<ChipHeader> = snapshot(&phone)?
+        .headers
+        .iter()
+        .map(|(n, t)| parse_chip_header(n, t))
+        .collect();
+    let mut expected: Vec<u32> = a
+        .expect_keyid
+        .iter()
+        .map(|s| parse_keyid(s))
+        .collect::<Result<_>>()?;
+    if let Some(fw) = &a.firmware {
+        let scratch = std::env::temp_dir().join(format!("titan-verify-{}", std::process::id()));
+        let found = find_firmware(fw, &flavor, &scratch);
+        let _ = std::fs::remove_dir_all(&scratch);
+        let (data, where_, _) = found?;
+        let body = rescue_payload(&data)?;
+        // Classify the image's headers with the chip's RO addresses: a header
+        // not at an RO base is an RW image, and its key is what the chip's RW
+        // should match.
+        let ro_bases: Vec<u32> = chip
+            .iter()
+            .filter(|h| h.name.starts_with("ro"))
+            .filter_map(|h| h.ro_base)
+            .collect();
+        for h in signed_headers(&body) {
+            let key = u32_at(&body, h.offset + KEYID);
+            if !ro_bases.contains(&h.ro_base) && !expected.contains(&key) {
+                expected.push(key);
+            }
+        }
+        ensure!(
+            !expected.is_empty(),
+            "no RW image found in {where_} to take an expected key from"
+        );
+        println!("expected RW key taken from {where_}");
+    }
+    let (lines, ok) = verify_keys(&chip, &expected);
+    println!("Titan M signing keys:");
+    for l in &lines {
+        println!("{l}");
+    }
+    ensure!(ok, "key verification failed");
+    Ok(())
+}
+
 pub fn run(a: TitanArgs) -> Result<()> {
+    if let Some(path) = &a.inspect {
+        return inspect(path);
+    }
+    if a.verify_keys {
+        return run_verify_keys(&a);
+    }
     let phone = fastboot::Device::open(a.serial.as_deref())?;
     let product = phone
         .getvar("product")?
@@ -787,10 +1093,27 @@ pub fn run(a: TitanArgs) -> Result<()> {
             h.rollback_level,
             h.keyid
         );
+        match header_delta(&chip, &body, h) {
+            Some((image, diffs)) if diffs.is_empty() => {
+                println!("    same as the chip's {image} in every field it reports")
+            }
+            Some((image, diffs)) => {
+                println!("    differs from the chip's {image}:");
+                for (field, chip, file) in diffs {
+                    println!("      {field}: chip {chip}, image {file}");
+                }
+            }
+            None => println!("    no chip image at this address to compare with"),
+        }
     }
     let check = rollback_check(&running, &builds, a.allow_downgrade)?;
-    let (floor_version, floor_level) =
-        header_check(&chip, &headers, a.allow_rollback_bump, a.allow_downgrade)?;
+    let (floor_version, floor_level) = header_check(
+        &chip,
+        &headers,
+        a.allow_rollback_bump,
+        a.allow_downgrade,
+        a.allow_other_key,
+    )?;
     println!(
         "floor {} ab{}, header {}, rollback level {floor_level}: image is {}",
         check.floor_name,
@@ -1002,7 +1325,7 @@ mod tests {
         assert!(c.same_as_booted && !c.downgrade);
         assert_eq!(c.floor, 15203921);
         assert_eq!(
-            header_check(&chip(), &signed_headers(&same()), false, false).unwrap(),
+            header_check(&chip(), &signed_headers(&same()), false, false, false).unwrap(),
             ((0, 2, 2), 2)
         );
     }
@@ -1023,24 +1346,24 @@ mod tests {
     fn unreadable_image_or_chip_is_refused() {
         assert!(rollback_check(&running(), &[], true).is_err());
         assert!(rollback_check(&[], &image_builds(&same()), true).is_err());
-        assert!(header_check(&chip(), &[], true, true).is_err());
-        assert!(header_check(&[], &signed_headers(&same()), true, true).is_err());
+        assert!(header_check(&chip(), &[], true, true, false).is_err());
+        assert!(header_check(&[], &signed_headers(&same()), true, true, false).is_err());
     }
 
     #[test]
     fn older_header_needs_the_flag() {
         let h = signed_headers(&header((0, 2, 1), 2, RW));
-        assert!(header_check(&chip(), &h, false, false)
+        assert!(header_check(&chip(), &h, false, false, false)
             .unwrap_err()
             .to_string()
             .contains("older than RW 0.2.2"));
-        assert!(header_check(&chip(), &h, false, true).is_ok());
+        assert!(header_check(&chip(), &h, false, true, false).is_ok());
     }
 
     #[test]
     fn lower_rollback_level_is_always_refused() {
         let h = signed_headers(&header((0, 2, 1), 1, RW));
-        assert!(header_check(&chip(), &h, true, true)
+        assert!(header_check(&chip(), &h, true, true, false)
             .unwrap_err()
             .to_string()
             .contains("would not boot"));
@@ -1049,29 +1372,89 @@ mod tests {
     #[test]
     fn higher_rollback_level_needs_the_flag() {
         let h = signed_headers(&header((0, 2, 3), 3, RW));
-        assert!(header_check(&chip(), &h, false, false)
+        assert!(header_check(&chip(), &h, false, false, false)
             .unwrap_err()
             .to_string()
             .contains("cannot be undone"));
-        assert!(header_check(&chip(), &h, true, false).is_ok());
+        assert!(header_check(&chip(), &h, true, false, false).is_ok());
     }
 
     #[test]
     fn other_signing_key_is_refused() {
         let mut d = header((0, 2, 2), 2, RW);
         d[KEYID..KEYID + 4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
-        let err = header_check(&chip(), &signed_headers(&d), true, true).unwrap_err();
+        let err = header_check(&chip(), &signed_headers(&d), true, true, false).unwrap_err();
         assert!(
             err.to_string().contains("signed with key 12345678"),
             "{err}"
         );
+        assert!(header_check(&chip(), &signed_headers(&d), true, true, true).is_ok());
         assert_eq!(chip()[1].keyid, Some(KEY));
+    }
+
+    #[test]
+    fn decodes_every_header_field() {
+        let d = same();
+        let f: std::collections::HashMap<_, _> = header_fields(&d, 4096).into_iter().collect();
+        assert_eq!(f["magic"], "fffffffd");
+        assert_eq!(f["keyid"], "894b7d29");
+        assert_eq!(f["ro_base"], "0x00084000");
+        assert_eq!(f["infomap"], "fffffffcffffffffffffffffffffffff");
+        assert_eq!(
+            (
+                f["epoch"].as_str(),
+                f["major"].as_str(),
+                f["minor"].as_str()
+            ),
+            ("0", "2", "2")
+        );
+    }
+
+    #[test]
+    fn chip_values_compare_as_text() {
+        // As Rick's bootloader and the IMEI thread's tree print them.
+        assert_eq!(
+            field_text("infomap", "FFFFFFFFFFFFFFFFFFFFFFFF1FFFFFFF"),
+            "ffffffffffffffffffffffff1fffffff"
+        );
+        assert_eq!(field_text("ro_base", "0x000a0000"), "0x000a0000");
+        assert_eq!(field_text("keyid", "68f379bd"), "68f379bd");
+        assert_eq!(field_text("minor", "2"), "2");
+        assert_eq!(
+            field_text("board_id", "0 ffffffff 10"),
+            "00000000 ffffffff 00000010"
+        );
+    }
+
+    #[test]
+    fn reports_the_fields_that_differ() {
+        let d = same();
+        let h = &signed_headers(&d)[1];
+        let (image, diffs) = header_delta(&chip(), &d, h).unwrap();
+        assert_eq!(image, "RW_A");
+        assert!(diffs.is_empty(), "{diffs:?}");
+        let mut other = chip();
+        other[1].raw.push(("keyid".into(), "68f379bd".into()));
+        other[1]
+            .raw
+            .retain(|(k, v)| k != "keyid" || v == "68f379bd");
+        let (_, diffs) = header_delta(&other, &d, h).unwrap();
+        assert_eq!(
+            diffs,
+            [(
+                "keyid".to_string(),
+                "68f379bd".to_string(),
+                "894b7d29".to_string()
+            )]
+        );
+        let lone = header((0, 2, 2), 2, 0x1234000);
+        assert!(header_delta(&chip(), &lone, &signed_headers(&lone)[0]).is_none());
     }
 
     #[test]
     fn ro_only_image_is_refused() {
         let h = signed_headers(&header((0, 2, 114), 0, RO));
-        assert!(header_check(&chip(), &h, true, true)
+        assert!(header_check(&chip(), &h, true, true, false)
             .unwrap_err()
             .to_string()
             .contains("only RO"));
@@ -1120,6 +1503,64 @@ mod tests {
             out.push(b'\n');
         }
         out
+    }
+
+    #[test]
+    fn keyid_rule_and_notes() {
+        assert!(prod_by_rule(0x68f3_79bd)); // bit 2 set
+        assert!(!prod_by_rule(0x894b_7d29)); // bit 2 clear
+        assert!(keyid_note(0x68f3_79bd).contains("production by Cr50 rule"));
+        assert!(keyid_note(0x894b_7d29).contains("komodo RO"));
+        assert!(keyid_note(0x1234_5678).contains("not in the known-key table"));
+        assert_eq!(parse_keyid("0x68f379bd").unwrap(), 0x68f3_79bd);
+        assert_eq!(parse_keyid(" 68F379BD ").unwrap(), 0x68f3_79bd);
+        assert!(parse_keyid("nothex").is_err());
+    }
+
+    // A chip with RO dev-keyed and RW prod-keyed, like Rick's komodo.
+    fn keyed_chip() -> Vec<ChipHeader> {
+        let h = |name: &str, keyid: &str| {
+            parse_chip_header(
+                name,
+                &format!(
+                    "(bootloader) hdr.ro_base: 80000\n(bootloader) hdr.keyid: {keyid}\nOKAY\n"
+                ),
+            )
+        };
+        vec![
+            h("ro_a", "894b7d29"),
+            h("rw_a", "68f379bd"),
+            h("rw_b", "68f379bd"),
+        ]
+    }
+
+    #[test]
+    fn verify_reports_and_checks_rw_keys() {
+        let c = keyed_chip();
+        let (lines, ok) = verify_keys(&c, &[]);
+        assert!(ok); // no expected -> report only
+        assert!(lines.iter().any(|l| l.contains("RO_A: key 894b7d29")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("development-keyed while RW is production-keyed")));
+
+        let (_, ok) = verify_keys(&c, &[0x68f3_79bd]);
+        assert!(ok);
+        let (lines, ok) = verify_keys(&c, &[0xdead_beef]);
+        assert!(!ok);
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("MISMATCH") && l.contains("deadbeef")));
+    }
+
+    #[test]
+    fn verify_fails_when_chip_has_no_rw_key() {
+        let ro_only = vec![parse_chip_header(
+            "ro_a",
+            "(bootloader) hdr.ro_base: 80000\n(bootloader) hdr.keyid: 894b7d29\nOKAY\n",
+        )];
+        let (_, ok) = verify_keys(&ro_only, &[0x68f3_79bd]);
+        assert!(!ok);
     }
 
     #[test]
