@@ -1,0 +1,113 @@
+diff --git a/bootable/recovery/fastboot/fastboot.cpp b/bootable/recovery/fastboot/fastboot.cpp
+index fd7b5f1..335007f 100644
+--- a/bootable/recovery/fastboot/fastboot.cpp
++++ b/bootable/recovery/fastboot/fastboot.cpp
+@@ -29,6 +29,41 @@
+ 
+ #include "recovery_ui/ui.h"
+ 
++#include <android-base/file.h>
++
++namespace {
++
++// Keep this path in sync with FASTBOOTD_FETCH_POLICY_PATH in
++// system/core/fastboot/device/fetch_policy.h. The fastbootd daemon is a
++// separate process that reads this tmpfs file before every `fetch`; writing it
++// from this on-screen menu is the only way to widen partition reading, and
++// nothing reachable over USB can change it.
++constexpr char kFetchPolicyPath[] = "/dev/fastbootd_fetch_policy";
++constexpr int kFetchReadAll = 1;       // "Enable reading"
++constexpr int kFetchUnrestricted = 2;  // "Enable all partitions"
++
++// Show a confirmation screen; only on an explicit yes, widen the fetch policy.
++// Reading is always read only: this never enables any write, flash or erase.
++void ConfirmAndEnableFetch(Device* device, int policy,
++                           const std::vector<std::string>& warning) {
++  RecoveryUI* ui = device->GetUI();
++  std::vector<std::string> items{ "Cancel", "Yes, enable reading" };
++  size_t chosen = ui->ShowMenu(
++      warning, items, 0 /* default to Cancel */, true /* menu_only */,
++      std::bind(&Device::HandleMenuKey, device, std::placeholders::_1, std::placeholders::_2));
++  if (chosen != 1) {
++    ui->Print("fastbootd: left partition reading disabled.\n");
++    return;
++  }
++  if (android::base::WriteStringToFile(std::to_string(policy), kFetchPolicyPath)) {
++    ui->Print("fastbootd: partition reading enabled (policy %d). Read only.\n", policy);
++  } else {
++    ui->Print("fastbootd: FAILED to enable partition reading.\n");
++  }
++}
++
++}  // namespace
++
+ static const std::vector<std::pair<std::string, Device::BuiltinAction>> kFastbootMenuActions{
+   { "Reboot system now", Device::REBOOT_FROM_FASTBOOT },
+   { "Enter recovery", Device::ENTER_RECOVERY },
+@@ -87,20 +122,51 @@ Device::BuiltinAction StartFastboot(Device* device, const std::vector<std::strin
+     LOG(ERROR) << "Failed to clear BCB message: " << err;
+   }
+ 
+-  std::vector<std::string> fastboot_menu_items;
+-  std::transform(kFastbootMenuActions.cbegin(), kFastbootMenuActions.cend(),
+-                 std::back_inserter(fastboot_menu_items),
+-                 [](const auto& entry) { return entry.first; });
+-
+-  auto chosen_item = ui->ShowMenu(
+-      {}, fastboot_menu_items, 0, false,
+-      std::bind(&Device::HandleMenuKey, device, std::placeholders::_1, std::placeholders::_2));
+-
+-  if (chosen_item == static_cast<size_t>(RecoveryUI::KeyError::INTERRUPTED)) {
+-    return Device::KEY_INTERRUPTED;
+-  }
+-  if (chosen_item == static_cast<size_t>(RecoveryUI::KeyError::TIMED_OUT)) {
+-    return Device::BuiltinAction::NO_ACTION;
++  // Two extra, read-only entries let the phone's owner widen `fastboot fetch`
++  // from the screen, each behind its own confirmation. They do not end the
++  // fastboot session: after a toggle the menu returns so the host can keep
++  // reading. Every built-in entry behaves exactly as upstream.
++  const size_t kEnableReadingItem = kFastbootMenuActions.size();
++  const size_t kEnableAllItem = kEnableReadingItem + 1;
++
++  while (true) {
++    std::vector<std::string> fastboot_menu_items;
++    std::transform(kFastbootMenuActions.cbegin(), kFastbootMenuActions.cend(),
++                   std::back_inserter(fastboot_menu_items),
++                   [](const auto& entry) { return entry.first; });
++    fastboot_menu_items.push_back("Enable reading (fetch any partition)");
++    fastboot_menu_items.push_back("Enable all partitions (also lift size limit)");
++
++    auto chosen_item = ui->ShowMenu(
++        {}, fastboot_menu_items, 0, false,
++        std::bind(&Device::HandleMenuKey, device, std::placeholders::_1, std::placeholders::_2));
++
++    if (chosen_item == static_cast<size_t>(RecoveryUI::KeyError::INTERRUPTED)) {
++      return Device::KEY_INTERRUPTED;
++    }
++    if (chosen_item == static_cast<size_t>(RecoveryUI::KeyError::TIMED_OUT)) {
++      return Device::BuiltinAction::NO_ACTION;
++    }
++
++    if (chosen_item == kEnableReadingItem) {
++      ConfirmAndEnableFetch(device, kFetchReadAll,
++                            { "ENABLE READING ALL PARTITIONS?", "",
++                              "This lets the connected computer read the full",
++                              "contents of ANY partition on this phone over USB,",
++                              "including device identifiers and user data.", "",
++                              "It never writes to the phone." });
++      continue;
++    }
++    if (chosen_item == kEnableAllItem) {
++      ConfirmAndEnableFetch(device, kFetchUnrestricted,
++                            { "ENABLE ALL PARTITIONS (NO SIZE LIMIT)?", "",
++                              "As 'Enable reading', and also removes the per-read",
++                              "size limit so very large partitions (super,",
++                              "userdata) can be read whole.", "",
++                              "Still read only. It never writes to the phone." });
++      continue;
++    }
++
++    return kFastbootMenuActions[chosen_item].second;
+   }
+-  return kFastbootMenuActions[chosen_item].second;
+ }
