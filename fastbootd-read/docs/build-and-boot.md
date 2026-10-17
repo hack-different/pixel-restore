@@ -91,6 +91,9 @@ in, and run:
 ./docker/build.sh boot              # or: ./scripts/boot-fastbootd.sh [--serial S]
 ```
 
+or, from the repo root, `pixel-restore fastbootd [--serial S] [--dry-run]`,
+which runs the same checks and the same boot from the Rust tool.
+
 Before sending anything that changes state, it checks, all read only:
 `fastboot` is on PATH; exactly one phone is in fastboot (or `--serial`); it is in
 the bootloader (`is-userspace: no`); `unlocked: yes`; the image exists, was
