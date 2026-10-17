@@ -17,6 +17,7 @@
 use crate::{fastboot, fbpk, fetch, restore};
 use anyhow::{bail, ensure, Context, Result};
 use clap::Args;
+use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -28,8 +29,9 @@ pub struct TitanArgs {
     #[arg(long, short)]
     firmware: Option<PathBuf>,
 
-    /// Decode the Titan M headers and build tags in this .bin or .rec and
-    /// stop; needs no phone.
+    /// Decode the Titan M headers, build tags and keys in this .bin or .rec
+    /// (each image's signer, and the RW keys each RO accepts) and stop;
+    /// needs no phone.
     #[arg(long, value_name = "FILE", conflicts_with_all = ["firmware", "build", "apply"])]
     inspect: Option<PathBuf>,
 
@@ -93,6 +95,10 @@ const GSC_WRITES: [&str; 2] = ["rescue", "reset"];
 const HEADER_SIZE: usize = 1024;
 const MAGICS: [u32; 2] = [0xFFFF_FFFD, 0xFFFF_FFFE];
 const KEYID: usize = 420;
+/// The signer's RSA public modulus, 96 little-endian words (3072 bits; a
+/// 2048-bit key leaves the top 32 words zero).
+const MODULUS: usize = 424;
+const KEY_WORDS: usize = 96;
 const IMAGE_SIZE: usize = 808;
 const RO_BASE: usize = 812;
 const RO_MAX: usize = 816;
@@ -128,6 +134,14 @@ pub fn prod_by_rule(keyid: u32) -> bool {
 pub const KNOWN_KEYIDS: &[(u32, &str)] = &[
     (0x68f3_79bd, "komodo RW (observed 2026-10-17)"),
     (0x894b_7d29, "komodo RO (observed 2026-10-17)"),
+    (
+        0x952b_3485,
+        "in the komodo/husky RO's RW key table; no RW seen signed with it",
+    ),
+    (
+        0xd985_131d,
+        "in the komodo/husky RO's RW key table; no RW seen signed with it",
+    ),
 ];
 
 /// A one-line note on a key id: the dev/prod rule and any known match.
@@ -301,6 +315,183 @@ pub fn signed_headers(data: &[u8]) -> Vec<Header> {
         off += 4;
     }
     out
+}
+
+/// Cr50's key id: the Montgomery constant -n^-1 mod 2^32 of the key's
+/// modulus, from its low word. Every signed header's `keyid` is this value
+/// for the modulus in its `key` field, and the RO's RW key table stores it
+/// in front of each modulus, so key ids can be recomputed from key material.
+pub fn n0inv(n0: u32) -> u32 {
+    // Newton's iteration for 1/n0 mod 2^32: an odd n0 is its own inverse to
+    // 3 bits, and each step doubles the correct bits.
+    let mut inv = n0;
+    for _ in 0..5 {
+        inv = inv.wrapping_mul(2u32.wrapping_sub(n0.wrapping_mul(inv)));
+    }
+    inv.wrapping_neg()
+}
+
+/// An RSA public key found in an image.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RsaKey {
+    /// Where the key's 96 modulus words start.
+    pub offset: usize,
+    /// Recomputed from the modulus with `n0inv`.
+    pub keyid: u32,
+    pub bits: u32,
+    /// The public exponent, when the image stores one after the modulus.
+    pub exponent: Option<u32>,
+    /// SHA-256 of the modulus as big-endian bytes, leading zeros dropped.
+    pub fingerprint: String,
+}
+
+fn rsa_key(data: &[u8], offset: usize, exponent: Option<u32>) -> RsaKey {
+    let mut be: Vec<u8> = data[offset..offset + 4 * KEY_WORDS]
+        .iter()
+        .rev()
+        .copied()
+        .skip_while(|&b| b == 0)
+        .collect();
+    if be.is_empty() {
+        be.push(0);
+    }
+    let bits = (be.len() as u32 - 1) * 8 + (8 - be[0].leading_zeros());
+    RsaKey {
+        offset,
+        keyid: n0inv(u32_at(data, offset)),
+        bits,
+        exponent,
+        fingerprint: format!("{:x}", Sha256::digest(&be)),
+    }
+}
+
+/// The key that signed the image whose header is at `off`. Its `keyid`
+/// should equal the header's; a mismatch means the header is not Cr50-shaped.
+pub fn header_key(data: &[u8], off: usize) -> RsaKey {
+    rsa_key(data, off + MODULUS, None)
+}
+
+/// Bytes per entry of an RO's RW key table: n0inv, 96 modulus words, then
+/// the public exponent.
+const KEY_ENTRY: usize = 4 * (KEY_WORDS + 2);
+
+/// The RSA keys an image carries in its body as Cr50 key structs
+/// (`n0inv`, 96 modulus words, exponent). In an RO image these are the keys
+/// it accepts for RW: on Titan M2 each RO has a table of three 2048-bit
+/// keys, one of which signs the shipped RW. Found by shape (a word that is
+/// the n0inv of the odd word after it, then a modulus of 1024 bits or
+/// more), so a random match is about one in 2^32 per word.
+pub fn embedded_keys(data: &[u8], h: &Header) -> Vec<RsaKey> {
+    let size = u32_at(data, h.offset + IMAGE_SIZE) as usize;
+    let end = (h.offset + size).min(data.len());
+    let mut out = Vec::new();
+    let mut off = h.offset + HEADER_SIZE;
+    while off + KEY_ENTRY <= end {
+        let n0 = u32_at(data, off + 4);
+        if n0 & 1 == 1 && u32_at(data, off) == n0inv(n0) {
+            let e = u32_at(data, off + 4 + 4 * KEY_WORDS);
+            let key = rsa_key(data, off + 4, [3, 65537].contains(&e).then_some(e));
+            if key.bits >= 1024 {
+                out.push(key);
+                off += KEY_ENTRY;
+                continue;
+            }
+        }
+        off += 4;
+    }
+    out
+}
+
+/// What the image's headers say about keys: each header's signer, each
+/// RO's table of accepted RW keys, and whether every RW image in the file
+/// is signed with a key some RO in the file accepts. Images are named by
+/// role (RO if it carries a key table) and order, A before B.
+pub fn key_report(data: &[u8], headers: &[Header]) -> Vec<String> {
+    let tables: Vec<Vec<RsaKey>> = headers.iter().map(|h| embedded_keys(data, h)).collect();
+    let mut seen = (0, 0);
+    let names: Vec<String> = tables
+        .iter()
+        .map(|t| {
+            let (kind, n) = if t.is_empty() {
+                seen.1 += 1;
+                ("RW", seen.1)
+            } else {
+                seen.0 += 1;
+                ("RO", seen.0)
+            };
+            match n {
+                1 => format!("{kind}_A"),
+                2 => format!("{kind}_B"),
+                _ => format!("{kind}_{n}"),
+            }
+        })
+        .collect();
+    let short = |f: &str| f[..16].to_string();
+    let mut lines = Vec::new();
+    for ((h, table), name) in headers.iter().zip(&tables).zip(&names) {
+        let signer = header_key(data, h.offset);
+        let consistent = if signer.keyid == h.keyid {
+            "matches its modulus".to_string()
+        } else {
+            format!("but its modulus gives {:08x}", signer.keyid)
+        };
+        lines.push(format!(
+            "{name} at {:#x}: signed by {:08x} ({}-bit, sha256 {}), key id {consistent}; {}",
+            h.offset,
+            h.keyid,
+            signer.bits,
+            short(&signer.fingerprint),
+            keyid_note(h.keyid)
+        ));
+        if !table.is_empty() {
+            lines.push(format!("  accepts RW signed by {} keys:", table.len()));
+            for k in table {
+                let e = k.exponent.map(|e| format!(", e={e}")).unwrap_or_default();
+                lines.push(format!(
+                    "    {:08x} at {:#x} ({}-bit{e}, sha256 {}); {}",
+                    k.keyid,
+                    k.offset - 4,
+                    k.bits,
+                    short(&k.fingerprint),
+                    keyid_note(k.keyid)
+                ));
+            }
+        }
+    }
+    let ros: Vec<(&String, &Vec<RsaKey>)> = names
+        .iter()
+        .zip(&tables)
+        .filter(|(_, t)| !t.is_empty())
+        .collect();
+    if !ros.is_empty() {
+        for ((h, table), name) in headers.iter().zip(&tables).zip(&names) {
+            if !table.is_empty() {
+                continue;
+            }
+            let signer = header_key(data, h.offset);
+            let by: Vec<&str> = ros
+                .iter()
+                .filter(|(_, t)| {
+                    t.iter()
+                        .any(|k| k.keyid == h.keyid && k.fingerprint == signer.fingerprint)
+                })
+                .map(|(n, _)| n.as_str())
+                .collect();
+            lines.push(if by.is_empty() {
+                format!(
+                    "{name} key {:08x} is NOT in any RO's key table here",
+                    h.keyid
+                )
+            } else {
+                format!(
+                    "{name} key {:08x} is accepted by {}",
+                    h.keyid,
+                    by.join(", ")
+                )
+            });
+        }
+    }
+    lines
 }
 
 /// The SignedHeader fields worth comparing, in the form `field_text` gives
@@ -867,6 +1058,10 @@ fn inspect(path: &Path) -> Result<()> {
             println!("    {field}: {value}");
         }
     }
+    println!("  keys:");
+    for l in key_report(&body, &headers) {
+        println!("    {l}");
+    }
     Ok(())
 }
 
@@ -984,6 +1179,39 @@ fn run_verify_keys(a: &TitanArgs) -> Result<()> {
             "no RW image found in {where_} to take an expected key from"
         );
         println!("expected RW key taken from {where_}");
+        // The RO in that firmware also lists every RW key it would accept.
+        let headers = signed_headers(&body);
+        let accepted: Vec<u32> = headers
+            .iter()
+            .flat_map(|h| embedded_keys(&body, h))
+            .map(|k| k.keyid)
+            .fold(Vec::new(), |mut v, k| {
+                if !v.contains(&k) {
+                    v.push(k);
+                }
+                v
+            });
+        if !accepted.is_empty() {
+            let list = accepted
+                .iter()
+                .map(|k| format!("{k:08x}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("its RO accepts RW keys: {list}");
+            for h in chip.iter().filter(|h| h.name.starts_with("rw")) {
+                if let Some(k) = h.keyid {
+                    let verdict = if accepted.contains(&k) {
+                        "in that RO's table"
+                    } else {
+                        "NOT in that RO's table"
+                    };
+                    println!(
+                        "  chip {} key {k:08x}: {verdict}",
+                        h.name.to_ascii_uppercase()
+                    );
+                }
+            }
+        }
     }
     let (lines, ok) = verify_keys(&chip, &expected);
     println!("Titan M signing keys:");
@@ -1503,6 +1731,96 @@ mod tests {
             out.push(b'\n');
         }
         out
+    }
+
+    // A Cr50 key struct for a 2048-bit modulus whose low word is `n0`:
+    // n0inv, 96 modulus words (top 32 zero), exponent.
+    fn key_entry(n0: u32) -> Vec<u8> {
+        let mut words = vec![n0inv(n0), n0];
+        words.extend((1..63).map(|i| 0x0101_0101u32.wrapping_mul(i)));
+        words.push(0xc000_0001); // top word: a full 2048-bit modulus
+        words.extend([0u32; 32]);
+        words.push(65537);
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    // An RO image whose header is signed by `ro_n0` and whose body carries
+    // a key table of `table` keys, then an RW image signed by `rw_n0`.
+    fn keyed_image(ro_n0: u32, table: &[u32], rw_n0: u32) -> Vec<u8> {
+        let signed = |n0: u32, base: u32| {
+            let mut d = header((0, 2, 2), 0, base);
+            let entry = key_entry(n0);
+            d[KEYID..KEYID + 4].copy_from_slice(&entry[0..4]);
+            d[MODULUS..MODULUS + 4 * KEY_WORDS].copy_from_slice(&entry[4..4 + 4 * KEY_WORDS]);
+            d
+        };
+        let mut d = signed(ro_n0, RO);
+        let mut at = HEADER_SIZE + 64;
+        for n0 in table {
+            let e = key_entry(*n0);
+            d[at..at + e.len()].copy_from_slice(&e);
+            at += e.len();
+        }
+        d.extend(signed(rw_n0, RW));
+        d
+    }
+
+    #[test]
+    fn n0inv_matches_real_titan_keys() {
+        // (low modulus word, key id) from the komodo/husky d3m2.ec.bin RO
+        // key table, cp1a.260505.005.
+        for (n0, id) in [
+            (0x1053_5bb3, 0x952b_3485),
+            (0x5321_b8cb, 0xd985_131d),
+            (0xb10b_766b, 0x68f3_79bd),
+        ] {
+            assert_eq!(n0inv(n0), id);
+        }
+        for n0 in [1u32, 3, 0xffff_ffff, 0x1234_5679] {
+            assert_eq!(n0.wrapping_mul(n0inv(n0)), u32::MAX);
+        }
+    }
+
+    #[test]
+    fn decodes_the_ro_rw_key_table() {
+        let d = keyed_image(
+            0x0000_0013,
+            &[0x1111_1111, 0x2222_2223, 0x3333_3335],
+            0x3333_3335,
+        );
+        let headers = signed_headers(&d);
+        assert_eq!(headers.len(), 2);
+        let table = embedded_keys(&d, &headers[0]);
+        assert_eq!(
+            table.iter().map(|k| k.keyid).collect::<Vec<_>>(),
+            [n0inv(0x1111_1111), n0inv(0x2222_2223), n0inv(0x3333_3335)]
+        );
+        assert!(table
+            .iter()
+            .all(|k| k.bits == 2048 && k.exponent == Some(65537)));
+        assert!(embedded_keys(&d, &headers[1]).is_empty());
+        let rw = header_key(&d, headers[1].offset);
+        assert_eq!(rw.keyid, headers[1].keyid);
+        assert_eq!(rw.fingerprint, table[2].fingerprint);
+
+        let report = key_report(&d, &headers).join("\n");
+        assert!(report.contains("RO_A at 0x0: signed by"), "{report}");
+        assert!(report.contains("key id matches its modulus"), "{report}");
+        assert!(report.contains("accepts RW signed by 3 keys"), "{report}");
+        assert!(report.contains(&format!(
+            "RW_A key {:08x} is accepted by RO_A",
+            n0inv(0x3333_3335)
+        )));
+    }
+
+    #[test]
+    fn flags_an_rw_key_no_ro_accepts() {
+        let d = keyed_image(0x0000_0013, &[0x1111_1111], 0x4444_4445);
+        let report = key_report(&d, &signed_headers(&d)).join("\n");
+        assert!(
+            report.contains("is NOT in any RO's key table here"),
+            "{report}"
+        );
     }
 
     #[test]
