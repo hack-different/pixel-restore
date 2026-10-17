@@ -14,6 +14,9 @@ the way `partialzip` does. This tool has three steps:
   listings
           do that for every image in the index and save each as
           <out>/<codename>/<build>.json, the complete file list per release
+  report  group the gathered blobs by chip, flavor and SHA-256 and decode
+          each distinct one (Titan SignedHeader versions, build tags, FBPK
+          platform and pack version) into report.json
   fetch   walk the index and pull every GSC firmware file (`*.rec`, `*.bin`:
           citadel ec.bin / ec.rec on Pixel 3-5, dauntless d2/d3/d3m2.bin on
           Tensor) out of each image into a folder, with a manifest of SHA-256s
@@ -523,13 +526,30 @@ def titan_info(data):
     versions = []
     for off in range(0, len(data) - 1024, 4):
         if data[off:off + 4] in TITAN_MAGIC:
+            size, ro_base, ro_max, rx_base, rx_max = struct.unpack("<IIIII", data[off + 808:off + 828])
             epoch, major, minor = struct.unpack("<III", data[off + 860:off + 872])
-            size = struct.unpack("<I", data[off + 808:off + 812])[0]
-            if 1024 <= size <= len(data) - off and max(epoch, major, minor) < 0x10000:
-                versions.append({"offset": off, "version": f"{epoch}.{major}.{minor}", "image_size": size})
+            timestamp = struct.unpack("<Q", data[off + 872:off + 880])[0]
+            p4cl = struct.unpack("<I", data[off + 880:off + 884])[0]
+            if 1024 <= size <= len(data) - off and ro_base < ro_max and max(epoch, major, minor) < 0x10000:
+                versions.append({"offset": off, "version": f"{epoch}.{major}.{minor}", "image_size": size,
+                                 "ro_base": ro_base, "ro_max": ro_max, "rx_base": rx_base, "rx_max": rx_max,
+                                 "timestamp": timestamp, "p4cl": p4cl,
+                                 "chip": "dauntless" if data[off] == 0xFD else "citadel"})
     if versions:
         info["headers"] = versions
+    tags = sorted({m.group(0).decode() for m in TAG_RE.finditer(data)})
+    if len(tags) > 1:
+        info["tags"] = tags
     return info
+
+
+def fbpk_info(data):
+    """{platform, pack_version, partitions} of an FBPK v2 pack."""
+    if len(data) < 112 or data[:4] != b"FBPK" or struct.unpack("<I", data[4:8])[0] != 2:
+        return {}
+    cstr = lambda b: b.split(b"\0", 1)[0].decode("ascii", "replace")
+    return {"platform": cstr(data[16:32]), "pack_version": cstr(data[32:96]).strip(),
+            "partitions": [n for n, _ in fbpk_entries(data)]}
 
 
 def open_source(url_or_path):
@@ -708,6 +728,53 @@ def cmd_listings(args):
         sys.exit(1)
 
 
+def cmd_report(args):
+    """Group everything `fetch` gathered by chip, flavor and SHA-256."""
+    out = Path(args.out)
+    manifest = json.loads((out / "manifest.json").read_text())
+    devices = {}
+    if args.devices:
+        devices = {r["codename"]: r for r in json.loads(Path(args.devices).read_text())["devices"]}
+    blobs = {}
+    for e in manifest["images"].values():
+        for f in e.get("files", []):
+            b = blobs.setdefault(f["sha256"], {"sha256": f["sha256"], "kind": f["kind"], "size": f["size"],
+                                               "name": f["path"].rsplit("/", 1)[-1], "releases": []})
+            b["releases"].append({"codename": e["codename"], "build": e["build"],
+                                  "description": e["description"], "path": f["path"]})
+    for b in blobs.values():
+        path = out / b["releases"][0]["path"]
+        data = path.read_bytes() if path.is_file() else b""
+        code = b["releases"][0]["codename"]
+        b["gsc"] = devices.get(code, {}).get("gsc") or manifest.get("gsc", {}).get(code)
+        if b["kind"] == "gsc":
+            b["flavor"] = re.sub(r"\.(ec\.)?(bin|rec)$", "", b["name"].lower())
+            b.update(titan_info(data))
+            chips = {h["chip"] for h in b.get("headers", [])}
+            if chips:
+                b["gsc"] = chips.pop() if len(chips) == 1 else "mixed"
+        elif b["kind"] in ("bootloader", "radio"):
+            b.update(fbpk_info(data))
+        b["codenames"] = sorted({r["codename"] for r in b["releases"]})
+        b["first_release"] = b["releases"][0]["description"]
+        b["last_release"] = b["releases"][-1]["description"]
+    groups = {}
+    for b in blobs.values():
+        key = f"{b['kind']}/{b.get('gsc') or 'unknown'}/{b.get('flavor') or b.get('platform') or '-'}"
+        groups.setdefault(key, []).append(b)
+    for key, items in sorted(groups.items()):
+        log(f"== {key}: {len(items)} distinct blobs")
+        for b in sorted(items, key=lambda b: (b.get("build", 0), b["first_release"])):
+            ver = ", ".join(h["version"] for h in b.get("headers", [])) or b.get("pack_version", "")
+            log(f"  {b['sha256'][:16]}  {b['size']:>9}  {ver:<24} {b.get('tag', '')} "
+                f"x{len(b['releases'])} {','.join(b['codenames'])}  {b['first_release']} .. {b['last_release']}")
+    report = {"generated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "images": len(manifest["images"]), "distinct_blobs": len(blobs),
+              "groups": {k: sorted(v, key=lambda b: (b.get("build", 0), b["first_release"])) for k, v in sorted(groups.items())}}
+    (out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+    log(f"wrote {out / 'report.json'}: {len(blobs)} distinct blobs in {len(groups)} groups")
+
+
 def cmd_fetch(args):
     doc = json.loads(Path(args.index).read_text())
     by = doc["by_codename"]
@@ -723,6 +790,7 @@ def cmd_fetch(args):
     manifest_path = out / "manifest.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {"images": {}}
     done = manifest["images"]
+    manifest.setdefault("gsc", {}).update({k: v["gsc"] for k, v in by.items()})
     # Blobs already on disk by SHA-256: a bootloader shared by ten releases is
     # stored once and hard-linked into the other nine (every copy is still
     # read and hashed, so the manifest's SHA-256s are all measured).
@@ -855,6 +923,10 @@ def main(argv=None):
                     help="partialzip lists only the outer ZIP; builtin (default) also lists the stored image-*.zip inside")
     ls.add_argument("--partialzip", help="path to the partialzip binary")
     ls.set_defaults(func=cmd_listings)
+    r = sub.add_parser("report", help="group gathered blobs by chip/flavor/SHA-256 and decode each into report.json")
+    r.add_argument("--out", required=True, help="the fetch output folder (holds manifest.json)")
+    r.add_argument("--devices", help="device-index.json, for the chip of codenames the manifest lacks")
+    r.set_defaults(func=cmd_report)
     f = sub.add_parser("fetch", help="pull every GSC firmware file out of the indexed images")
     f.add_argument("--index", required=True, help="JSON from `index`")
     f.add_argument("--out", required=True, help="folder for <codename>/<build>/... and manifest.json")

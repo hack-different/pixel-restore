@@ -46,6 +46,8 @@ def fbpk(entries):
     out = bytearray(112 + 104 * len(entries))
     out[0:4] = b"FBPK"
     struct.pack_into("<IIII", out, 4, 2, 112, 104, 0)
+    out[16:23] = b"zumapro"
+    out[32:40] = b"test-1.0"
     struct.pack_into("<I", out, 104, len(entries))
     for i, (name, kind, payload) in enumerate(entries):
         while len(out) % 16:
@@ -305,6 +307,21 @@ class HttpTests(unittest.TestCase):
             self.assertEqual(os.stat(out / same[0]["path"]).st_ino, os.stat(out / same[0]["same_as"]).st_ino)
             # A second run reads nothing new.
             g.main(["fetch", "--index", str(index), "--out", str(out), "--backend", "builtin"])
+            g.main(["report", "--out", str(out)])
+            rep = json.loads((out / "report.json").read_text())
+            self.assertEqual(rep["images"], 3)
+            gsc = rep["groups"]["gsc/dauntless/d3m2"]
+            self.assertEqual(len(gsc), 2)  # the firmware and the .rec rescue image
+            fw = next(b for b in gsc if "headers" in b)
+            self.assertEqual(fw["headers"][0]["version"], "0.2.2")
+            self.assertEqual(fw["headers"][0]["chip"], "dauntless")
+            self.assertEqual(fw["tag"], "nugget_v0.2.2.ab12345678-0123abcd-bricked")
+            self.assertEqual(fw["codenames"], ["komodo"])
+            self.assertGreaterEqual(len(fw["releases"]), 3)  # partition + .bin copies across two releases
+            bl = rep["groups"]["bootloader/dauntless/zumapro"]
+            self.assertEqual(bl[0]["pack_version"], "test-1.0")
+            self.assertEqual(bl[0]["partitions"], ["abl", "d3m2"])
+            self.assertEqual(len(bl[0]["releases"]), 2)
             # The carrier build 404s on the test server and is recorded as an error.
             self.assertIn("error", man["images"]["komodo-cp3a.260905.009.v1-factory-deadbeef.zip"])
 
