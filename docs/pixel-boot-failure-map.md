@@ -2,8 +2,9 @@
 
 A map of the places on a Tensor Pixel (Pixel 6 and newer) where a mismatch,
 a rollback, or corruption can stop the phone booting, with what in this repo
-can detect each one. It is a companion to `docs/titan-key-verification.md` and
-`docs/modem-repair.md`.
+can detect each one. It is a companion to `docs/tensor-boot-order.md` (what
+each boot image is and the order they run in), `docs/titan-key-verification.md`
+and `docs/modem-repair.md`.
 
 Scope and honesty: the boot order and several of these interactions are
 documented by Google only in part. Items marked (inferred) are reasoned from
@@ -20,8 +21,9 @@ else can be rewritten from a factory image.
 
 ## 1. AP bootloader anti-rollback (the classic brick)
 
-The Tensor boot chain is BL1 -> PBL -> LDFW -> ABL (and the GSA/BL2 stages
-between). Each stage carries an anti-rollback version. When a bootloader with
+The Tensor boot chain is PBL(irom) -> BL1 -> BL2 -> BL31/LDFW -> ABL (with the
+GSA/TZSW secure stages loaded along the way; see `docs/tensor-boot-order.md`).
+Each stage carries an anti-rollback version. When a bootloader with
 a **higher** rollback version has run, the phone will no longer accept a
 bootloader below that floor, and a phone flashed below the floor drops into
 "Pixel ROM Recovery" (Exynos USB boot) and will not reach fastboot.
