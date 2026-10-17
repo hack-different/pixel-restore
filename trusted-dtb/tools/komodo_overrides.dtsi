@@ -1,0 +1,75 @@
+/*
+ * Trusted-tree overrides for komodo (zuma pro).
+ *
+ * This file is appended to the stock komodo base .dts before compilation, so
+ * the base's own &labels are in scope. Each fragment re-opens a node by its
+ * label or path to change it. Edit this to target whatever the stock tree is
+ * suspected of hiding.
+ *
+ * Two kinds of change we care about:
+ *   1. Re-enable / re-add hardware the stock tree omitted or disabled.
+ *   2. Remove /reserved-memory carveouts so Linux may map that RAM.
+ *
+ * IMPORTANT caveats:
+ *   - The &labels below (spi_11, hsi2c_8, ...) are PLACEHOLDERS. Confirm the
+ *     real controller labels and reg addresses against the zumapro SoC .dtsi
+ *     and the Zuma TRM before building. Wrong reg/CS = no probe or a bus hang.
+ *   - Re-enabling a controller whose pinctrl/clocks the stock tree also
+ *     disabled needs those enabled too, or probe fails. Copy the matching
+ *     pinctrl state from the SoC dtsi.
+ *   - Removing a reserved-memory region the firmware still fences in hardware
+ *     (SMMU/MPU, GSA/Titan) does NOT make it readable; the kernel will fault
+ *     or the device will secure-reboot. Test each region (see runbook).
+ *
+ * Start SMALL: flip one node, build, boot, see if it probes, before adding
+ * more. A tree that won't probe anything is harder to debug than one change.
+ */
+
+/* ---- 1. Example: re-enable a SPI controller the stock tree disabled ----
+ *
+ * If stock marked a SPI bus `status = "disabled"` (or omitted a child chip),
+ * re-enable the controller and declare the child so its driver binds.
+ * Replace spi_11 with the real label, and fill in the child's compatible,
+ * reg (chip-select index) and spi-max-frequency from its datasheet.
+ */
+&spi_11 {
+	status = "okay";
+
+	/* The chip the stock tree did not declare. */
+	trusted_spi_dev: spidev@0 {
+		compatible = "rohm,dh2228fv"; /* placeholder; use the real part */
+		reg = <0>;                    /* chip select 0 */
+		spi-max-frequency = <10000000>;
+		status = "okay";
+	};
+};
+
+/* ---- 2. Example: re-enable an I2C controller ---- */
+/*
+&hsi2c_8 {
+	status = "okay";
+};
+*/
+
+/* ---- 3. Remove reserved-memory carveouts to expose RAM ----
+ *
+ * Drop the nodes for regions we want Linux to map. Names below are typical
+ * zuma carveout labels; confirm against the baseline dump. Only drop what you
+ * intend to probe, and expect hardware-fenced ones to fault anyway.
+ */
+&reserved_memory {
+	/* /delete-node/ modem_shmem; */
+	/* /delete-node/ gsa_reserved; */
+	/* /delete-node/ tpu_fw_reserved; */
+};
+
+/*
+ * If a carveout is declared directly under / rather than a labelled
+ * reserved-memory node, delete by path at root scope instead, e.g.:
+ *
+ * / {
+ *     reserved-memory {
+ *         / delete-node / modem@90000000 ;
+ *     };
+ * };
+ */
