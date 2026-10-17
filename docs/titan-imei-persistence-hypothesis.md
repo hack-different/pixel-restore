@@ -8,6 +8,8 @@ device's GSC and modem regions) have not yet been collected.
 
 **Companion documents:** `docs/titan-ro-rw-disclosure.md` (the RO/RW
 write-protect bypass), `docs/titan-flash-layout.md`, `docs/titan-key-verification.md`,
+`docs/titan-gsc-firmware-stages.md` (EVT/proto vs retail GSC firmware, and an
+engineering→retail rollback-conflict candidate for the ~1% restore failures),
 `docs/modem-repair.md` (IMEI/EFS/persist repair), `docs/pixel-boot-failure-map.md`.
 
 ---
