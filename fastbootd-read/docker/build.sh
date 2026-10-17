@@ -1,51 +1,91 @@
 #!/usr/bin/env bash
-# Build a read-enabled fastbootd + recovery for komodo inside the Docker image.
+# One command, run from the HOST (macOS or Linux): sync GrapheneOS, generate
+# the komodo vendor files, apply the read-enable patches, build, verify, and
+# copy the images out.
 #
-# Run from the HOST (macOS). It builds the image, then runs the build inside the
-# container against an AOSP/GrapheneOS tree you have already `repo sync`-ed.
+#   ./docker/build.sh            # sync + vendor + patch + build (re-runs are incremental)
+#   ./docker/build.sh shell      # a shell in the container, tree at /aosp
 #
-#   SRC=/path/to/aosp-or-grapheneos-tree ./docker/build.sh
+# All of the work happens inside the container (scripts/container-build.sh).
+# Nothing here talks to a phone.
 #
-# Variables:
-#   SRC           Host path of the synced platform tree (required).
-#   LUNCH_TARGET  lunch combo (default: komodo-userdebug). For GrapheneOS use the
-#                 channel target its build docs name, e.g. komodo-cur-userdebug.
-#                 userdebug matters: it defines FB_ENABLE_FETCH (so `fetch` is
-#                 compiled in) and keeps the recovery/fastbootd domains able to
-#                 share the tmpfs policy file.
-#   CCACHE_DIR    Host ccache dir (default: $SRC/.ccache).
-#   PLATFORM      Container platform (default: linux/amd64 for the x86_64
-#                 AOSP host toolchain; override only on a native x86_64 host).
+# Where the source tree lives:
+#   By default in a Docker named volume ($VOLUME). On a Mac that is the right
+#   place: it is a case-sensitive Linux filesystem inside Docker's VM, which
+#   AOSP needs and a normal APFS folder is not. Give Docker Desktop enough disk
+#   (Settings > Resources > Disk usage limit): about 300 GB for the tree, the
+#   build output and ccache. Set SRC to use a host directory instead (a Linux
+#   host, or a case-sensitive APFS volume).
+#
+# Variables (all optional):
+#   BRANCH        GrapheneOS manifest branch (default: 17, what the patches target)
+#   TAG           a GrapheneOS release tag instead of BRANCH; the manifest's
+#                 signature is verified against grapheneos.org/allowed_signers
+#   MANIFEST_URL  default: https://github.com/GrapheneOS/platform_manifest.git
+#   DEVICE        default: komodo
+#   VARIANT       default: userdebug (it compiles `fastboot fetch` into fastbootd)
+#   LUNCH_TARGET  default: $DEVICE-cur-$VARIANT
+#   SYNC          1 = repo init + sync (default), 0 = build the tree as it is
+#   VENDOR        auto (default: run adevtool once per manifest revision), 1, 0
+#   JOBS          repo sync jobs (default: 8)
+#   VOLUME        source volume name (default: fastbootd-read-src)
+#   SRC           host path for the tree instead of VOLUME
+#   CCACHE_DIR    host path for ccache (default: volume fastbootd-read-ccache)
+#   ARTIFACTS     where images are copied (default: fastbootd-read/out/$DEVICE)
+#   PLATFORM      container platform (default: linux/amd64)
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$here/.." && pwd)"
-: "${SRC:?Set SRC to your synced AOSP/GrapheneOS tree}"
-LUNCH_TARGET="${LUNCH_TARGET:-komodo-userdebug}"
-CCACHE_DIR="${CCACHE_DIR:-$SRC/.ccache}"
+DEVICE="${DEVICE:-komodo}"
 PLATFORM="${PLATFORM:-linux/amd64}"
-mkdir -p "$CCACHE_DIR"
+VOLUME="${VOLUME:-fastbootd-read-src}"
+ARTIFACTS="${ARTIFACTS:-$repo_root/out/$DEVICE}"
+mode="${1:-build}"
+case "$mode" in
+  build|shell) ;;
+  *) echo "usage: $0 [build|shell]" >&2; exit 2 ;;
+esac
+
+command -v docker >/dev/null || { echo "!! docker is not installed" >&2; exit 1; }
+docker info >/dev/null 2>&1 || { echo "!! the Docker daemon is not running" >&2; exit 1; }
+
+if [ -n "${SRC:-}" ]; then
+  mkdir -p "$SRC"
+  src_mount="$SRC"
+else
+  docker volume create "$VOLUME" >/dev/null
+  src_mount="$VOLUME"
+fi
+if [ -n "${CCACHE_DIR:-}" ]; then
+  mkdir -p "$CCACHE_DIR"
+  ccache_mount="$CCACHE_DIR"
+else
+  docker volume create fastbootd-read-ccache >/dev/null
+  ccache_mount=fastbootd-read-ccache
+fi
+mkdir -p "$ARTIFACTS"
 
 echo ">> Building Docker image (fastbootd-read-builder)"
 docker build --platform "$PLATFORM" -t fastbootd-read-builder "$here"
 
-echo ">> Building $LUNCH_TARGET in container (SRC=$SRC)"
-docker run --rm -it --platform "$PLATFORM" \
-  -v "$SRC":/aosp \
-  -v "$repo_root":/patches:ro \
-  -v "$CCACHE_DIR":/ccache \
-  -e CCACHE_DIR=/ccache \
-  -e LUNCH_TARGET="$LUNCH_TARGET" \
-  fastbootd-read-builder \
-  bash -lc '
-    set -euo pipefail
-    cd /aosp
-    /patches/scripts/apply-patches.sh /aosp /patches
-    ccache -M 50G >/dev/null || true
-    source build/envsetup.sh
-    lunch "$LUNCH_TARGET"
-    # Rebuild the daemon, the recovery binary, and the ramdisk-carrying images.
-    m fastbootd recovery bootimage vendorbootimage
-    echo ">> Build done. Artifacts under: $OUT"
-    ls -la "$OUT"/boot.img "$OUT"/vendor_boot.img 2>/dev/null || true
-  '
+tty=()
+[ -t 0 ] && [ -t 1 ] && tty=(-it)
+env_args=(-e DEVICE="$DEVICE")
+for v in BRANCH TAG MANIFEST_URL VARIANT LUNCH_TARGET SYNC VENDOR JOBS; do
+  [ -n "${!v:-}" ] && env_args+=(-e "$v=${!v}")
+done
+
+run=(docker run --rm "${tty[@]}" --platform "$PLATFORM"
+  -v "$src_mount":/aosp
+  -v "$repo_root":/patches:ro
+  -v "$ccache_mount":/ccache
+  -v "$ARTIFACTS":/artifacts
+  "${env_args[@]}"
+  fastbootd-read-builder)
+
+if [ "$mode" = shell ]; then
+  exec "${run[@]}" bash
+fi
+echo ">> Source tree: $src_mount   artifacts: $ARTIFACTS"
+"${run[@]}" bash /patches/scripts/container-build.sh

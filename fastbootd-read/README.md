@@ -33,27 +33,34 @@ fastbootd-read/
   patches/      git-apply-clean patches for AOSP system/core + bootable/recovery
   aosp-new/     the two new daemon source files, for reference
   docker/       Linux build environment (Dockerfile + build.sh) — macOS can't build AOSP
-  scripts/      apply-patches, verify/assemble image, read-partitions wrapper
+  scripts/      container-build (sync/vendor/patch/build), apply-patches,
+                verify image, read-partitions wrapper
   docs/         design.md (mechanism) and build-and-boot.md (how to build + boot)
 ```
 
 ## Quick start
 
 ```sh
-# 1. Sync a komodo-capable tree (GrapheneOS recommended) into $SRC, then:
-SRC=/path/to/tree LUNCH_TARGET=komodo-userdebug ./docker/build.sh
-# 2. Verify the patch landed in the binary:
-OUT=$SRC/out/target/product/komodo ./scripts/make-boot-image.sh
-# 3. Boot it temporarily on the unlocked phone (see docs/build-and-boot.md),
+# 1. One command: syncs GrapheneOS (branch 17) into a Docker volume, generates
+#    the komodo vendor files with adevtool, applies the patches, builds
+#    komodo-cur-userdebug, verifies the patch is in the binary, and copies the
+#    images to fastbootd-read/out/komodo/. Re-runs are incremental.
+./docker/build.sh
+# 2. Boot it temporarily on the unlocked phone (see docs/build-and-boot.md),
 #    pick "Enable reading" on the phone screen, then:
 ./scripts/read-partitions.sh --serial <serial> ~/pixel-partitions
 ```
 
+Needs Docker with about 300 GB of disk and 32 GB+ of memory for the VM. The
+first run takes hours. `BRANCH`, `TAG`, `DEVICE`, `SYNC=0`, `SRC=<host dir>`
+and the others are listed at the top of `docker/build.sh`;
+`./docker/build.sh shell` opens a shell on the tree.
+
 ## Status
 
 - **Verified:** the fetch-gating analysis against real upstream source, and that
-  both patches apply cleanly (`git apply --check`) to their stated bases
-  (`system/core` @ AOSP `main`; `bootable/recovery` @ GrapheneOS `17`).
+  both patches apply cleanly to GrapheneOS `17` (`system/core` and
+  `bootable/recovery`, checked 2026-10-17).
 - **Needs the phone + a Linux builder (your step):** compiling for komodo, and
   confirming on-device that `fastboot boot` enters the modified fastbootd. This
   was developed in a cloud container with no Android tree, no USB and no device,

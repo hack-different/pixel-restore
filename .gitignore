@@ -9,3 +9,7 @@ __pycache__/
 
 # Standalone historical prototype build output
 /legacy/restore_pixel_tensor/target/
+
+# fastbootd-read build output (docker/build.sh)
+/fastbootd-read/out/
+/fastbootd-read-image/
