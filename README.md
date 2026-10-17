@@ -393,8 +393,10 @@ so the per-release folders cost no extra disk. To keep only one file per
 distinct `.rec` / `.bin` / `.img`:
 
 ```sh
-# 4. unique/<kind>/<sha256-prefix>-<name> plus unique/index.json listing the releases that share each
+# 4. unique/<kind>/<stem>-<sha256-prefix>.<ext> plus unique/index.json listing the releases that share each
 python3 tools/pixel_gsc_fetch.py unique --out gsc-firmware --prune   # --prune drops the per-release copies
+#    or just the Titan firmware, flat, into the repo: data/ec/<stem>-<sha256-prefix>.bin + data/ec/index.json
+python3 tools/pixel_gsc_fetch.py unique --out gsc-firmware --dest data/ec --kinds gsc,bin
 # 5. group by chip / flavor and decode headers (versions, build tags, FBPK partitions) into report.json
 python3 tools/pixel_gsc_fetch.py report --out gsc-firmware --devices data/device-index.json
 ```

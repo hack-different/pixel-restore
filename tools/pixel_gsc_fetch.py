@@ -818,25 +818,31 @@ def cmd_report(args):
 
 def cmd_unique(args):
     """Keep one copy of every distinct .rec / .bin / .img `fetch` gathered:
-    <out>/unique/<kind>/<sha256-prefix>-<name>, hard-linked to (or copied
-    from) the first release that carried it, with unique/index.json saying
-    which releases share each blob. `--prune` then removes the per-release
-    copies so only the unique files and the JSON records remain."""
+    <out>/unique/<kind>/<stem>-<sha256-prefix>.<ext>, or flat in `--dest`,
+    hard-linked to (or copied from) the first release that carried it, with
+    <dest>/index.json saying which releases share each blob. `--kinds gsc,bin
+    --dest data/ec` collects just the Titan firmware; `--prune` then removes
+    the per-release copies so only the unique files and the JSON records
+    remain."""
     out = Path(args.out)
     manifest = json.loads((out / "manifest.json").read_text())
-    udir = out / "unique"
+    udir = Path(args.dest) if args.dest else out / "unique"
+    kinds = tuple(k.strip() for k in args.kinds.split(",") if k.strip()) if args.kinds else KINDS
     blobs = {}
     for e in manifest["images"].values():
         for f in e.get("files", []):
+            if f["kind"] not in kinds:
+                continue
             b = blobs.setdefault(f["sha256"], {"sha256": f["sha256"], "kind": f["kind"], "size": f["size"],
                                                "name": f["path"].rsplit("/", 1)[-1], "releases": []})
             b["releases"].append({"codename": e["codename"], "build": e["build"],
                                   "description": e["description"], "path": f["path"]})
     kept = missing = 0
     for sha, b in blobs.items():
-        rel = Path("unique") / b["kind"] / f"{sha[:16]}-{b['name']}"
-        dest = out / rel
-        b["path"] = rel.as_posix()
+        stem, dot, ext = b["name"].rpartition(".")
+        fname = f"{stem or ext}-{sha[:12]}{dot + ext if stem else ''}"
+        dest = (udir if args.dest else udir / b["kind"]) / fname
+        b["path"] = (dest.relative_to(out) if udir.is_relative_to(out) else dest).as_posix()
         if not dest.is_file():
             src = next((out / r["path"] for r in b["releases"] if (out / r["path"]).is_file()), None)
             if src is None:
@@ -865,7 +871,7 @@ def cmd_unique(args):
                 if p.is_file():
                     p.unlink()
                     removed += 1
-        for d in sorted((p for p in out.rglob("*") if p.is_dir() and not p.is_relative_to(udir)), reverse=True):
+        for d in sorted((p for p in out.rglob("*") if p.is_dir() and not (udir.is_relative_to(out) and p.is_relative_to(udir))), reverse=True):
             if not any(d.iterdir()):
                 d.rmdir()
         log(f"pruned {removed} per-release copies; the <codename>/<build>.json records still name them")
@@ -1042,6 +1048,8 @@ def main(argv=None):
     f.set_defaults(func=cmd_fetch)
     u = sub.add_parser("unique", help="keep one copy of each distinct .rec/.bin/.img under <out>/unique/<kind>/")
     u.add_argument("--out", required=True, help="the fetch output folder (holds manifest.json)")
+    u.add_argument("--dest", help="folder for the unique copies (default <out>/unique); e.g. data/ec for the GSC blobs")
+    u.add_argument("--kinds", help=f"only these kinds: {', '.join(KINDS)} (default all)")
     u.add_argument("--prune", action="store_true", help="remove the per-release copies afterwards")
     u.set_defaults(func=cmd_unique)
     args = p.parse_args(argv)

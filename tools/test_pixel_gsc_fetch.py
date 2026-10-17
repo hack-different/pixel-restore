@@ -330,9 +330,17 @@ class HttpTests(unittest.TestCase):
             uidx = json.loads((out / "unique/index.json").read_text())
             self.assertEqual(len(uidx["blobs"]), rep["distinct_blobs"])
             ubl = next(b for b in uidx["blobs"] if b["kind"] == "bootloader")
-            self.assertEqual(ubl["path"], f"unique/bootloader/{ubl['sha256'][:16]}-bootloader-komodo-ripcurrent-1.img")
+            self.assertEqual(ubl["path"], f"unique/bootloader/bootloader-komodo-ripcurrent-1-{ubl['sha256'][:12]}.img")
             self.assertEqual((out / ubl["path"]).read_bytes(), BL)
             self.assertEqual(len(ubl["releases"]), 2)
+            ec = Path(d, "ec")
+            g.main(["unique", "--out", str(out), "--dest", str(ec), "--kinds", "gsc,bin"])
+            eidx = json.loads((ec / "index.json").read_text())
+            self.assertEqual({b["kind"] for b in eidx["blobs"]}, {"gsc"})
+            self.assertEqual(sorted(p.name for p in ec.iterdir() if p.suffix != ".json"),
+                             sorted(f"{b['name'].rsplit('.', 1)[0]}-{b['sha256'][:12]}.{b['name'].rsplit('.', 1)[1]}"
+                                    for b in eidx["blobs"]))
+            self.assertTrue(all(Path(b["path"]).is_absolute() and Path(b["path"]).is_file() for b in eidx["blobs"]))
             g.main(["unique", "--out", str(out), "--prune"])
             self.assertFalse((out / same[0]["path"]).exists())
             self.assertFalse((out / "komodo/cp3a.260905.009").exists())
