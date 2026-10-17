@@ -444,8 +444,7 @@ def parse_gsc_header(fields):
         if key == "magic" and number is not None:
             out[key] = {"value": f"{number:08x}", "chip": GSC_HEADER_MAGIC.get(number, "unknown")}
         elif key == "keyid" and number is not None:
-            # G_SIGNED_FOR_PROD: production keys have bit 2 set.
-            out[key] = {"value": f"{number:08x}", "signed_for": "production" if number & 4 else "development"}
+            out[key] = {"value": f"{number:08x}", "signed_for": number}
         elif key == "tag":
             try:
                 text = bytes.fromhex(str(value).strip()).rstrip(b"\0").decode("ascii")
@@ -479,6 +478,12 @@ def parse_gsc_header(fields):
                 out[key] = value
         else:
             out[key] = value
+    if isinstance(out.get("keyid"), dict):
+        # Cr50's G_SIGNED_FOR_PROD: production keys have bit 2 set. Only
+        # confirmed for H1; on Titan M chips the rule is unverified.
+        rule = "production" if out["keyid"]["signed_for"] & 4 else "development"
+        h1 = isinstance(out.get("magic"), dict) and out["magic"]["value"] == "ffffffff"
+        out["keyid"]["signed_for"] = rule if h1 else f"{rule} (Cr50 rule, unconfirmed for this chip)"
     if all(k in out for k in ("epoch", "major", "minor")):
         out["image_version"] = f"{out['epoch']}.{out['major']}.{out['minor']}"
     return out

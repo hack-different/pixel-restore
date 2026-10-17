@@ -212,7 +212,7 @@ fn cached_bootloader(image: &Image) -> Result<PathBuf> {
 
 /// The full factory ZIP, from the cache when it already passed its
 /// SHA-256 check, else downloaded (resuming a partial one).
-fn cached_zip(image: &Image) -> Result<PathBuf> {
+pub(crate) fn cached_zip(image: &Image) -> Result<PathBuf> {
     let dir = images_root().join(&image.device);
     let path = dir.join(image.file_name());
     let marker = path.with_extension("zip.sha256");

@@ -105,6 +105,23 @@ impl Device {
         self.checked(&["flash", partition, &path])
     }
 
+    /// `fastboot oem <args>`: whether it succeeded, and everything it printed
+    /// (the bootloader's `(bootloader) ...` lines go to stderr).
+    pub fn oem(&self, args: &[&str]) -> Result<(bool, String)> {
+        let mut full = vec!["-s", self.serial.as_str(), "oem"];
+        full.extend_from_slice(args);
+        let out = run(&full)?;
+        let text = String::from_utf8_lossy(&out.stderr).into_owned()
+            + &String::from_utf8_lossy(&out.stdout);
+        Ok((out.status.success() && !text.contains("FAILED"), text))
+    }
+
+    /// `fastboot stage <file>`: download it for the next command to use.
+    pub fn stage(&self, file: &Path) -> Result<()> {
+        let path = file.to_string_lossy();
+        self.checked(&["stage", &path])
+    }
+
     pub fn reboot_bootloader(&self) -> Result<()> {
         self.checked(&["reboot-bootloader"])
     }

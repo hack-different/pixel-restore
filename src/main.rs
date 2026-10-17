@@ -11,6 +11,7 @@ mod packs;
 mod remotezip;
 mod restore;
 mod stages;
+mod titan;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -102,6 +103,11 @@ enum Cmd {
     /// backups of its modem partitions (efs, persist ...). For a blank or
     /// "unknown" IMEI, or no baseband, after a flash.
     RepairModem(RepairModemArgs),
+    /// Repair the Titan M security chip from fastboot: send its RW firmware
+    /// (d3m2.bin on a Titan M2) with `fastboot stage`, `oem gsc rescue` and
+    /// `oem gsc reset`, refusing anything older than the chip runs unless
+    /// --allow-downgrade. Nothing is sent without --apply.
+    Titan(titan::TitanArgs),
 }
 
 #[derive(Args)]
@@ -255,6 +261,7 @@ fn run() -> Result<()> {
             out,
         } => fetch_cmd(&device, build.as_deref(), full, list, url.as_deref(), &out),
         Cmd::RepairModem(args) => repair_modem(args),
+        Cmd::Titan(args) => titan::run(args),
     }
 }
 
