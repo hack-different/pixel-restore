@@ -5,7 +5,7 @@
 **Class:** Write-protect bypass / read-only-region integrity (CWE-1282-adjacent: boundary computed from a size constant that changed between parts).
 **Researcher:** Rick Mark (https://blog.rickmark.me/untitled-2/).
 **Write-up date:** 2026-10-17.
-**CVE:** none assigned (historical, already mitigated by the vendor in later firmware).
+**CVE:** none assigned (historical, already mitigated by the vendor in later firmware). A retrospective CVE request has been prepared — see `docs/titan-ro-rw-cve-request.md`.
 
 ---
 
@@ -104,6 +104,18 @@ remote one.
     slot (`RO_A` would report `0x0`). A re-dump tagged per slot
     (`fastboot oem gsc header` per image, decoded by `pixel-restore titan
     --inspect`) would make the A-vs-B attribution unambiguous.
+- **Dauntless flash size corroborated across images**: every Dauntless GSC
+  image inspected for this project (`d3m2.ec.bin` from multiple komodo and husky
+  factory images) is exactly 1 MiB (`0x100000`), so the midpoint is `0x80000`.
+  Those images also contain `BluejayRescueReprovisionFromDauntlessToTz` /
+  `BluejayRescueReprovisionFromTzToDauntless` reprovision routines, i.e. a
+  rescue/reprovision path exists in shipping firmware.
+- **Production observation of the bricked state**: the researcher reports
+  observing the relevant bricked GSC firmware state on a *production* device
+  (not a lab-only or leaked image), indicating the bricked/rescue state is
+  reachable outside controlled conditions. The bricked rescue image is a live
+  on-device state, not a standalone file in the public factory images scanned
+  here.
 - **The cross-part RO_B→RW_A overlap and the eFUSE fix**: from the researcher's
   own reverse-engineering write-up. These specifics are not published in a Google
   advisory; the precise Citadel `RW_A` extent that `RO_B` overlaps comes from the
