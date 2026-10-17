@@ -72,6 +72,8 @@ fn summarize(log: &str) -> Vec<String> {
     let key = |l: &str| {
         let low = l.to_ascii_lowercase();
         low.contains("reboot reason")
+            || low.contains("reboot mode")
+            || low.contains("enter reason")
             || low.contains("reset reason")
             || low.contains("panic")
             || low.contains("rejected")
@@ -88,8 +90,41 @@ fn summarize(log: &str) -> Vec<String> {
     out
 }
 
+/// How the last boot ended, from the bootloader log. Its final "Reboot
+/// reason" and "Reboot mode" lines describe the reset that brought the phone
+/// back (earlier ones, in the DSS block, can be from an older reset).
+#[derive(Debug, PartialEq)]
+enum Ending {
+    /// Software asked for the bootloader: the kernel ran, and Android's init
+    /// reboots to the bootloader when it hits a fatal error.
+    InitFatal,
+    Panic,
+    Watchdog,
+    Other(String),
+}
+
+fn ending(log: &str) -> Option<Ending> {
+    let last = |key: &str| {
+        log.lines()
+            .rev()
+            .find_map(|l| l.split_once(key).map(|(_, v)| v.trim().to_string()))
+    };
+    let reason = last("Reboot reason:")?;
+    let mode = last("Reboot mode:").unwrap_or_default();
+    let low = reason.to_ascii_lowercase();
+    Some(if low.contains("panic") {
+        Ending::Panic
+    } else if low.contains("watchdog") {
+        Ending::Watchdog
+    } else if low.contains("s/w reboot") && mode.to_ascii_lowercase().contains("bootloader") {
+        Ending::InitFatal
+    } else {
+        Ending::Other(reason)
+    })
+}
+
 /// Save the bootloader's log to `dir` and print what matters in it.
-fn save_dmesg(phone: &fastboot::Device, dir: &Path) -> Result<PathBuf> {
+fn save_dmesg(phone: &fastboot::Device, dir: &Path) -> Result<Option<Ending>> {
     let (_, log) = phone.oem(&["dmesg"])?;
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -108,7 +143,7 @@ fn save_dmesg(phone: &fastboot::Device, dir: &Path) -> Result<PathBuf> {
     for l in shown {
         println!("  {l}");
     }
-    Ok(path)
+    Ok(ending(&log))
 }
 
 /// `out`: the kernel (and its os_version and command line) from
@@ -360,21 +395,25 @@ pub fn run(a: FastbootdArgs) -> Result<()> {
             if phone.getvar("is-userspace")?.as_deref() == Some("yes") {
                 break;
             }
-            save_dmesg(&phone, &art)?;
-            let hint = if a.kernel == "built" {
-                format!(
-                    " The built kernel only matches the phone's modules when it runs the same \
-                     build; try again without --kernel built to use the phone's own kernel \
-                     (bootloader {bootloader})."
-                )
-            } else {
-                String::new()
+            let how = match save_dmesg(&phone, &art)? {
+                Some(Ending::InitFatal) => "the kernel booted, then software rebooted to the \
+                     bootloader: Android's init does that on a fatal error, so init stopped \
+                     before recovery or fastbootd started"
+                    .to_string(),
+                Some(Ending::Panic) | Some(Ending::Watchdog) if a.kernel == "built" => format!(
+                    "the kernel crashed. The built kernel only matches the phone's device tree \
+                     and modules when it runs the same build; try again without --kernel built \
+                     to use the phone's own kernel (bootloader {bootloader})"
+                ),
+                Some(Ending::Panic) => "the kernel panicked".to_string(),
+                Some(Ending::Watchdog) => "a watchdog reset the phone".to_string(),
+                Some(Ending::Other(r)) => format!("the bootloader recorded: {r}"),
+                None => "the bootloader log gives no reboot reason".to_string(),
             };
             bail!(
-                "the phone came back in the bootloader, so the image did not stay up (it \
-                 crashed and reset; the reboot reason above says how). Nothing was written.{hint} \
-                 The kernel's own log of the crash is in the next Android boot's \
-                 `adb bugreport` (LAST KMSG)."
+                "the phone came back in the bootloader; {how}. Nothing was written. The \
+                 kernel's log of that boot is the LAST KMSG section of `adb bugreport` on the \
+                 next Android boot (`fastboot reboot`)."
             );
         }
         if in_adb(&phone.serial) {
@@ -465,6 +504,25 @@ mod tests {
         let shown = summarize(&many);
         assert_eq!(shown.len(), 12);
         assert_eq!(shown[0], "[E] err 8");
+    }
+
+    #[test]
+    fn reads_how_the_last_boot_ended() {
+        // An older DSS record first, then the reset that brought the phone back.
+        let log = "[PRE] Reboot reason: 0xccca - Long Press Power Key Reboot\n\
+                   [PRE] Reboot mode: 0x0 - Normal Boot\n\
+                   Reboot Info:\n  Reboot reason: 0xcafe - User Reboot(S/W Reboot)\n\
+                   \x20 Reboot mode: 0xfc - Bootloader\n";
+        assert_eq!(ending(log), Some(Ending::InitFatal));
+        assert_eq!(
+            ending("Reboot reason: 0xbaba - Kernel PANIC\n"),
+            Some(Ending::Panic)
+        );
+        assert_eq!(
+            ending("Reboot reason: 0xccca - Long Press Power Key Reboot\n"),
+            Some(Ending::Other("0xccca - Long Press Power Key Reboot".into()))
+        );
+        assert_eq!(ending("nothing here"), None);
     }
 
     #[test]
