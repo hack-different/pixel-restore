@@ -64,6 +64,15 @@ SRC=/path/on/linux ./docker/build.sh  # keep the tree in a host directory instea
 ./docker/build.sh shell               # a shell in the container, tree at /aosp
 ```
 
+The build runs steps inside AOSP's nsjail sandbox, so `build.sh` starts the
+container with `--security-opt seccomp=unconfined`, `apparmor=unconfined` and
+`systempaths=unconfined`. Those are the three Docker restrictions that stop
+nsjail. It does not need `--privileged`. Without them Soong prints "Build
+sandboxing disabled due to nsjail error", and adevtool aborts on that line. The
+build runs Soong's own nsjail self-test before adevtool and stops with this
+advice if it fails. `DOCKER_RUN_OPTS=--privileged ./docker/build.sh` is the
+fallback for a host that still refuses.
+
 The build runs as the image's unprivileged `node` user (uid 1000), because
 adevtool refuses to run as root. On the first run, the tree from an earlier
 root-run sync is handed to that user once, which takes a few minutes for a full

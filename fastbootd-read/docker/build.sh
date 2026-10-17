@@ -37,6 +37,8 @@
 #   CCACHE_DIR    host path for ccache (default: volume fastbootd-read-ccache)
 #   ARTIFACTS     where images are copied (default: fastbootd-read/out/$DEVICE)
 #   PLATFORM      container platform (default: linux/amd64)
+#   DOCKER_RUN_OPTS  extra `docker run` options, e.g. --privileged if the
+#                 build's nsjail sandbox still cannot start
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -85,7 +87,19 @@ for v in BRANCH TAG MANIFEST_URL VARIANT LUNCH_TARGET SYNC VENDOR JOBS CHOWN; do
   [ -n "${!v:-}" ] && env_args+=(-e "$v=${!v}")
 done
 
+# The platform build runs its steps in an nsjail sandbox. That needs the
+# namespace syscalls Docker's default seccomp profile blocks, mounts its
+# AppArmor profile blocks, and a fresh /proc, which Docker's masked /proc
+# paths prevent. Without them Soong prints "Build sandboxing disabled due to
+# nsjail error", which adevtool treats as a failure. These lift only those
+# three restrictions (not --privileged); DOCKER_RUN_OPTS adds more if a host
+# still refuses.
+# shellcheck disable=SC2206 # DOCKER_RUN_OPTS is meant to split into words
+extra=(${DOCKER_RUN_OPTS:-})
 run=(docker run --rm ${tty[@]+"${tty[@]}"} --platform "$PLATFORM"
+  --security-opt seccomp=unconfined --security-opt apparmor=unconfined
+  --security-opt systempaths=unconfined
+  ${extra[@]+"${extra[@]}"}
   -v "$src_mount":/aosp
   -v "$repo_root":/patches:ro
   -v "$ccache_mount":/ccache

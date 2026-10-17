@@ -61,6 +61,7 @@ if [ ! -d .repo ] && [ "$free_gb" -lt 250 ]; then
 fi
 [ "$mem_gb" -ge 32 ] || echo "   warning: GrapheneOS recommends 32 GB+ of memory; the build may be killed."
 
+
 if [ "$SYNC" = 1 ] || [ ! -d .repo ]; then
   rev="$BRANCH"
   [ -n "$TAG" ] && rev="refs/tags/$TAG"
@@ -84,6 +85,21 @@ if [ "$SYNC" = 1 ] || [ ! -d .repo ]; then
     [ "$attempt" = 3 ] && { echo "!! repo sync failed three times"; exit 1; }
     echo "   sync failed; retrying ($attempt/3)"
   done
+fi
+
+# Soong runs build steps in nsjail. If nsjail cannot start, Soong carries on
+# unsandboxed but prints a warning that makes adevtool abort. Run Soong's own
+# self-test with the tree's nsjail first, so that fails here with a fix.
+nsjail=prebuilts/build-tools/linux-x86/bin/nsjail
+# shellcheck disable=SC2016 # the hostname check runs inside the sandbox
+if [ -x "$nsjail" ] && ! "$nsjail" -Q -H android-build -e -u nobody -g nogroup -R / -B /tmp \
+    --disable_clone_newcgroup -- /bin/bash -c '[ "$(hostname)" = android-build ]' >/dev/null 2>&1; then
+  echo "!! The build's nsjail sandbox cannot start in this container, so adevtool"
+  echo "   would fail with \"Build sandboxing disabled due to nsjail error\"."
+  echo "   docker/build.sh passes --security-opt seccomp=unconfined, apparmor=unconfined"
+  echo "   and systempaths=unconfined for it. If this host still refuses, run with"
+  echo "   DOCKER_RUN_OPTS=--privileged ./docker/build.sh"
+  exit 1
 fi
 
 # envsetup.sh, lunch and m are not written for `set -eu`; check each step instead.
