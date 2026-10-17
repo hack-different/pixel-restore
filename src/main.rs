@@ -1,4 +1,5 @@
 mod arb;
+mod bootimg;
 mod devices;
 mod dnw;
 mod eub;

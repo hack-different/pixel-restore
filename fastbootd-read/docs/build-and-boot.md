@@ -92,7 +92,25 @@ in, and run:
 ```
 
 or, from the repo root, `pixel-restore fastbootd [--serial S] [--dry-run]`,
-which runs the same checks and the same boot from the Rust tool.
+which runs the same checks and the same boot from the Rust tool, with two
+differences:
+
+- **Kernel.** By default it boots the built ramdisks with the kernel from
+  the phone's own `boot_<slot>`, read with `fastboot fetch` (read only), and
+  leaves out the built vendor_kernel_boot. The bootloader always pairs the
+  boot image's kernel with the phone's vendor_kernel_boot (device tree and
+  modules), so the built kernel panics on a phone that runs another build.
+  A komodo still on its launch bootloader (ripcurrentpro-14.6-12019008,
+  AD1A.240530.030, kernel 6.1.75) dropped straight back to the bootloader
+  with the 6.1.177 GrapheneOS kernel. `--kernel built` boots the image as
+  built; `--kernel <boot.img>` takes the kernel from another image, e.g. the
+  factory image the phone runs.
+- **Diagnosis.** When the image drops back to the bootloader it saves
+  `fastboot oem dmesg` (the bootloader's log) next to the image and prints its
+  reboot reason (`kernel_panic`, a watchdog ...) and last errors.
+  `pixel-restore fastbootd --dmesg` does only that. The kernel's own log of
+  the crash is the LAST KMSG section of `adb bugreport` on the next Android
+  boot.
 
 Before sending anything that changes state, it checks, all read only:
 `fastboot` is on PATH; exactly one phone is in fastboot (or `--serial`); it is in
