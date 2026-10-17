@@ -1,11 +1,12 @@
 mod dnw;
 mod eub;
+mod fastboot;
 mod fbpk;
 mod fetch;
 mod remotezip;
 mod stages;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -74,6 +75,55 @@ enum Cmd {
         #[arg(long, short, default_value = ".")]
         out: PathBuf,
     },
+    /// Repair a phone's modem from fastboot: reflash the radio image that
+    /// matches its bootloader, and optionally write back the phone's own
+    /// backups of its modem partitions (efs, persist ...). For a blank or
+    /// "unknown" IMEI, or no baseband, after a flash.
+    RepairModem(RepairModemArgs),
+}
+
+#[derive(Args)]
+struct RepairModemArgs {
+    /// radio-*.img, or the factory ZIP containing one. Use the same build as
+    /// the bootloader on the phone.
+    #[arg(long, short)]
+    image: Option<PathBuf>,
+
+    /// Instead of --image, fetch radio-*.img for this device (codename or
+    /// model name) from Google, a few tens of MB via range requests.
+    #[arg(long, conflicts_with = "image")]
+    device: Option<String>,
+
+    /// With --device, the build id to take the radio from (e.g.
+    /// cp3a.260905.009). Default: the newest generic build.
+    #[arg(long, short, requires = "device")]
+    build: Option<String>,
+
+    /// Write back a backup of one of this phone's modem partitions:
+    /// `--restore efs=efs.img`. Repeatable. Only for images taken from this
+    /// same phone; the IMEI lives in them.
+    #[arg(long, value_name = "PARTITION=FILE")]
+    restore: Vec<String>,
+
+    /// Fastboot serial of the phone. Not needed when only one is attached.
+    #[arg(long, short)]
+    serial: Option<String>,
+
+    /// Where to save a radio image pulled out of a ZIP.
+    #[arg(long, short, default_value = ".")]
+    out: PathBuf,
+
+    /// Show what would be flashed and stop.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Do not ask before flashing.
+    #[arg(long, short)]
+    yes: bool,
+
+    /// Boot Android when done, instead of staying in the bootloader.
+    #[arg(long)]
+    reboot: bool,
 }
 
 #[derive(Args)]
@@ -162,6 +212,7 @@ fn run() -> Result<()> {
             url,
             out,
         } => fetch_cmd(&device, build.as_deref(), full, list, url.as_deref(), &out),
+        Cmd::RepairModem(args) => repair_modem(args),
     }
 }
 
@@ -558,4 +609,269 @@ fn boot(args: BootArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Partitions `repair-modem --restore` will write. They hold the modem's
+/// calibration and identity (IMEI) data, which a factory image never carries,
+/// so the only valid source is a backup of the same phone.
+const MODEM_PARTITIONS: &[&str] = &["efs", "efs_backup", "modem_userdata", "persist"];
+
+/// The device codename in a factory file name such as
+/// `radio-komodo-g5400c-....img` or `komodo-cp3a....-factory-....zip`.
+fn codename_in(file: &str) -> Option<&str> {
+    let rest = file
+        .strip_prefix("radio-")
+        .or_else(|| file.strip_prefix("bootloader-"))
+        .unwrap_or(file);
+    rest.split('-').next().filter(|c| !c.is_empty())
+}
+
+/// The baseband version a radio image carries, from its file name:
+/// `radio-komodo-g5400c-250909-250916-b-14110587.img` gives
+/// `g5400c-250909-250916-b-14110587`, which is how `getvar version-baseband`
+/// spells it (modulo case).
+fn radio_version(file: &str) -> Option<String> {
+    let rest = file.strip_prefix("radio-")?.strip_suffix(".img")?;
+    let (_, version) = rest.split_once('-')?;
+    Some(version.to_ascii_lowercase())
+}
+
+/// The bootloader version in `bootloader-komodo-ripcurrentpro-17.0-1234.img`.
+fn bootloader_version(file: &str) -> Option<String> {
+    let rest = file.strip_prefix("bootloader-")?.strip_suffix(".img")?;
+    let (_, version) = rest.split_once('-')?;
+    Some(version.to_ascii_lowercase())
+}
+
+/// The radio image to flash, plus the bootloader file name from the same
+/// build when known (to check the pair matches the phone).
+fn radio_source(args: &RepairModemArgs) -> Result<Option<(PathBuf, Option<String>)>> {
+    if let Some(dev) = &args.device {
+        let code = fetch::codename(dev)?;
+        let images = fetch::list_images(&code)?;
+        let image = fetch::pick_latest(&images, args.build.as_deref()).ok_or_else(|| {
+            anyhow!(
+                "no build '{}' for {code}; see `fetch {code} --list`",
+                args.build.as_deref().unwrap_or("?")
+            )
+        })?;
+        println!("{code}: {}", image.description);
+        println!(
+            "(downloading accepts Google's factory-image terms, as on {})",
+            fetch::IMAGES_PAGE
+        );
+        let path = fetch::fetch_radio(image, &args.out)?;
+        // The listing has no bootloader name; the build id is what matters.
+        return Ok(Some((path, None)));
+    }
+    let Some(path) = &args.image else {
+        return Ok(None);
+    };
+    let is_zip = path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("zip"));
+    if !is_zip {
+        return Ok(Some((path.clone(), None)));
+    }
+    let mut src = remotezip::FileRange::open(path)?;
+    let members = remotezip::list(&mut src)?;
+    let radio = remotezip::find_image(&members, "radio").ok_or_else(|| {
+        anyhow!(
+            "no radio-*.img in {}; is it a factory image ZIP (not an OTA)?",
+            path.display()
+        )
+    })?;
+    let bootloader =
+        remotezip::find_image(&members, "bootloader").map(|m| m.base_name().to_string());
+    let data = remotezip::extract(&mut src, radio)?;
+    std::fs::create_dir_all(&args.out)?;
+    let out = args.out.join(radio.base_name());
+    std::fs::write(&out, &data).with_context(|| format!("writing {}", out.display()))?;
+    println!("extracted {} ({} bytes)", out.display(), data.len());
+    Ok(Some((out, bootloader)))
+}
+
+fn file_name(p: &std::path::Path) -> String {
+    p.file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn confirm(prompt: &str) -> Result<bool> {
+    use std::io::Write;
+    print!("{prompt} [type yes] ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim().eq_ignore_ascii_case("yes"))
+}
+
+fn repair_modem(args: RepairModemArgs) -> Result<()> {
+    let mut restores = Vec::new();
+    for (part, file) in parse_kv(&args.restore, "restore")? {
+        let part = part.to_ascii_lowercase();
+        if !MODEM_PARTITIONS.contains(&part.as_str()) {
+            bail!(
+                "--restore only writes the modem partitions ({}), not '{part}'",
+                MODEM_PARTITIONS.join(", ")
+            );
+        }
+        let path = PathBuf::from(&file);
+        let len = std::fs::metadata(&path)
+            .with_context(|| format!("reading {file}"))?
+            .len();
+        ensure!(len > 0, "{file} is empty");
+        restores.push((part, path));
+    }
+    restores.sort();
+    if args.image.is_none() && args.device.is_none() && restores.is_empty() {
+        bail!(
+            "nothing to do: give the radio with --image <radio-*.img or factory.zip> or \
+             --device <codename>, and/or a backup with --restore efs=<file>"
+        );
+    }
+
+    // Talk to the phone before downloading anything, so a missing or
+    // ambiguous device fails fast.
+    let phone = fastboot::Device::open(args.serial.as_deref())?;
+    let var = |name: &str| -> Result<String> {
+        Ok(phone.getvar(name)?.unwrap_or_else(|| "?".to_string()))
+    };
+    let product = var("product")?;
+    let unlocked = var("unlocked")?;
+    let bootloader = var("version-bootloader")?;
+    let baseband = var("version-baseband")?;
+    println!(
+        "phone {}: product {product}, bootloader {bootloader}",
+        phone.serial
+    );
+    println!("  baseband now: {baseband}");
+    println!("  unlocked: {unlocked}");
+
+    let radio = radio_source(&args)?;
+    if let Some((path, zip_bootloader)) = &radio {
+        let name = file_name(path);
+        if let Some(code) = codename_in(&name) {
+            if name.starts_with("radio-") && product != "?" && !code.eq_ignore_ascii_case(&product)
+            {
+                bail!("{name} is for {code}, but this phone is {product}");
+            }
+        }
+        let want = radio_version(&name);
+        println!(
+            "radio to flash: {name}{}",
+            want.as_deref()
+                .map(|v| format!(" (baseband {v})"))
+                .unwrap_or_default()
+        );
+        if want.is_some() && want.as_deref() == Some(baseband.to_ascii_lowercase().as_str()) {
+            println!(
+                "  note: the phone already reports this baseband. Reflashing still rewrites \
+                 the modem partition, which fixes a corrupted one."
+            );
+        }
+        if let Some(bl) = zip_bootloader.as_deref().and_then(bootloader_version) {
+            if bootloader != "?" && !bl.eq_ignore_ascii_case(&bootloader) {
+                println!(
+                    "  warning: this build's bootloader is {bl} but the phone runs {bootloader}. \
+                     A radio from a different build than the bootloader is the usual cause of \
+                     a missing baseband/IMEI; flash the bootloader from the same build \
+                     (or use the factory image that matches the phone)."
+                );
+            }
+        }
+    }
+    for (part, path) in &restores {
+        println!("restore {part} from {}", path.display());
+    }
+    if !restores.is_empty() {
+        println!(
+            "  these must be backups of THIS phone ({}); another phone's efs/persist would \
+             give it the wrong identity and calibration.",
+            phone.serial
+        );
+    }
+    if unlocked == "no" {
+        bail!(
+            "the bootloader is locked, so fastboot will refuse to flash the modem. Unlocking \
+             (`fastboot flashing unlock`) wipes user data; if you go that way, back up first."
+        );
+    }
+    if args.dry_run {
+        println!("dry run: nothing flashed");
+        return Ok(());
+    }
+    if !args.yes && !confirm(&format!("flash this to {}?", phone.serial))? {
+        bail!("not confirmed; nothing flashed");
+    }
+
+    if let Some((path, _)) = &radio {
+        println!("fastboot flash radio {}", path.display());
+        phone.flash("radio", path)?;
+        // The bootloader writes the modem image on its next start, so
+        // reboot into it before touching anything else.
+        println!("fastboot reboot-bootloader");
+        phone.reboot_bootloader()?;
+        wait_for_fastboot(&phone.serial, Duration::from_secs(60))?;
+    }
+    for (part, path) in &restores {
+        println!("fastboot flash {part} {}", path.display());
+        phone.flash(part, path)?;
+    }
+
+    let after = var("version-baseband")?;
+    println!("baseband after: {after}");
+    if after == "?" || after.is_empty() {
+        println!(
+            "  the bootloader still reports no baseband; the radio may not match the \
+             bootloader. Flash both from the same factory image."
+        );
+    }
+    if args.reboot {
+        phone.reboot()?;
+        println!("rebooting; check the IMEI with *#06# or Settings > About phone");
+    } else {
+        println!(
+            "done. `fastboot reboot`, then check the IMEI with *#06# or Settings > About phone"
+        );
+    }
+    Ok(())
+}
+
+fn wait_for_fastboot(serial: &str, wait: Duration) -> Result<()> {
+    let started = std::time::Instant::now();
+    std::thread::sleep(Duration::from_secs(2));
+    while started.elapsed() < wait {
+        if fastboot::devices()?.iter().any(|s| s == serial) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    bail!("{serial} did not come back to fastboot within {wait:?}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_versions_from_file_names() {
+        let radio = "radio-komodo-g5400c-250909-250916-b-14110587.img";
+        assert_eq!(codename_in(radio), Some("komodo"));
+        assert_eq!(
+            radio_version(radio).as_deref(),
+            Some("g5400c-250909-250916-b-14110587")
+        );
+        let bl = "bootloader-komodo-ripcurrentpro-17.0-14129999.img";
+        assert_eq!(codename_in(bl), Some("komodo"));
+        assert_eq!(
+            bootloader_version(bl).as_deref(),
+            Some("ripcurrentpro-17.0-14129999")
+        );
+        assert_eq!(
+            codename_in("komodo-cp3a.260905.009-factory-99eb621a.zip"),
+            Some("komodo")
+        );
+        assert_eq!(radio_version("modem.img"), None);
+    }
 }
