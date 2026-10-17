@@ -31,7 +31,7 @@ revisions, Android 17 limitations, and explicit write instructions.
 ```sh
 pixel-restore modem --help
 pixel-restore modem sources
-pixel-restore modem diagnose --serial YOUR_ADB_SERIAL
+pixel-restore modem diagnose
 ```
 
 ## Build
@@ -136,6 +136,28 @@ The default pulls only `bootloader-*.img` out of the ZIP with HTTP range
 requests; `--full` gets you the image for flash-all. Fetching accepts
 Google's factory-image terms, the same as clicking Acknowledge on the page.
 `--url <zip url>` skips the listing page.
+
+### Restore from fastboot
+
+```sh
+pixel-restore restore                  # dry run: pick the lowest safe build, download and unpack it
+pixel-restore restore --apply --wipe   # flash it; tries the next newer build if one fails
+pixel-restore restore --build cp3a.260905.009 --apply   # a specific build, still floor-checked
+pixel-restore restore --device husky --build cp3a.260905.009   # no phone: just fill the cache
+```
+
+With the phone unlocked in fastboot, `restore` reads its bootloader version,
+works out its anti-rollback floor (`src/arb.rs`) and starts at the oldest
+build at or above it. Without a known floor it never goes below the phone's
+current bootloader. It flashes bootloader and radio to the current slot,
+checks `version-bootloader`, copies both to the other slot, then runs
+`fastboot update`. Use `--wipe` when going back to an older Android than the
+phone last ran. It stays below any anti-rollback bump the phone has not
+taken yet (that is permanent, and a phone below the Pixel 8's May 2025 bump
+is one whose ROM still takes the recovery pack); `--cross-rollback-bump`
+lifts that. Google's listing, each candidate's bootloader and the full
+ZIPs are cached in `~/Library/Caches/pixel-restore/images/` (or
+`$PIXEL_RESTORE_CACHE/images/`); downloads resume and are SHA-256 checked.
 
 ### Other commands
 

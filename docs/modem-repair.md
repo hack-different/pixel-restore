@@ -13,18 +13,89 @@ if the interpreter is not called `python3`. The helper also works directly:
 ```sh
 python3 tools/pixel_modem.py --help
 pixel-restore modem sources
-pixel-restore modem diagnose --serial YOUR_ADB_SERIAL
+pixel-restore modem diagnose
 ```
 
-Every device command requires a serial. `diagnose` reads build, baseband and
+Every device command talks to one phone by serial. `--serial` is optional:
+with exactly one phone attached (in adb, or in fastboot for the fastboot
+commands) that phone is used, and with several the command stops and asks for
+`--serial` rather than picking one. `diagnose` reads build, baseband and
 bootloader properties and classifies recent Google Play services log messages.
 It does not request root or save raw logs/accounts/tokens. Its optional `--out`
 JSON includes the device serial and fingerprint. Logs can be historical: retry
 sign-in immediately before diagnosis to associate the findings with that attempt.
 
+With the phone in fastboot instead (it is the only place `diagnose` finds it,
+or `--fastboot` is given), it reports what the bootloader exposes: product,
+bootloader and baseband versions, unlock state, slot, hardware revision and
+battery, with findings for a missing baseband, a locked bootloader and an
+unsupported model. Sign-in logs need Android, so that part is skipped.
+It reads `fastboot getvar all`, the read-only `fastboot oem get_config all`,
+and the Titan M queries `fastboot oem gsc version`, `fastboot oem gsc header`
+for `ro_a`, `ro_b`, `rw_a` and `rw_b`, and `fastboot oem gsc avb state`. Their
+answers land under the `gsc` (Titan M) variables as `firmware_version`,
+`firmware_headers` and `avb_state`: parsed into fields when the bootloader
+prints `name: value` lines, otherwise kept as raw lines.
+Partition variables become one object per partition (per-slot sizes
+under `slots`), slot variables become slot objects, and only variables shown
+nowhere else are listed under `variables`. Modem partitions (`modem`, `efs`,
+`efs_backup`, `persist`, `devinfo` ...) and modem variables appear only in the
+`modem` section. Findings add missing or zero-sized modem partitions and
+whether the active slot has a modem. The bootloader exposes no IMEI, EFS
+contents or modem logs; those need Android (and root for EFS).
+
+On a terminal the report prints as a tree with friendly names (`devinfo` is
+"Manufacturer Device Info", `efs` "Encrypted File Storage"), the raw key in
+parentheses, and problems in red; `--json`, a pipe or `NO_COLOR` change that.
+`--out` always writes JSON.
+
+`--package <factory.zip>` (fastboot) lists which of the phone's partitions that
+factory image rewrites (bootloader and radio pack entries, the images in
+`image-*.zip`, and `super` via `super_empty`), which it does not, split into
+partitions unique to this phone (`devinfo`, `efs`, `persist`, `userdata` ...)
+and others, and what is only in the package (usually logical partitions).
+
+### Checking the modem partitions agree
+
+```sh
+pixel-restore modem diagnose --pull .pixel-restore/backups/check   # adb + root: back up, then check
+pixel-restore modem diagnose --backup .pixel-restore/backups/check # check an existing backup
+```
+
+In fastboot only `--backup` works (fastboot cannot read partitions), and the
+backup is also compared with the IMEIs in the bootloader's oem config. The
+check parses devinfo's IMEI records, recognises ext4 images (label, UUID,
+clean flag) and blank ones, and reports whether: both devinfo IMEIs are valid
+and distinct; `efs` and `efs_backup` are identical; `cpsha` is present in
+persist; the devinfo IMEIs appear in efs/persist and in which encoding (ASCII,
+UTF-16, TBCD, 3GPP mobile identity); any other IMEI-shaped numbers are stored
+there; and the oem config IMEIs match devinfo. IMEIs are shown as the last four
+digits unless `--show-identifiers` is given. Nothing is written to the phone.
+
 The motivating failure is Google's check-in rejecting a malformed IMEI before
 account entry. A network error displayed by Play Store alone does not establish
 this diagnosis. `invalid_imei_checkin: true` identifies the matching log message.
+
+### Reading every small partition
+
+```sh
+cargo run -- modem read-partitions --out ~/pixel-partitions
+```
+
+Reads every partition up to `--max-size` (default `100M`) into a new private
+folder, then reports each image's format from its magic numbers: boot and
+vendor_boot images, vbmeta (with its rollback index), appended AVB footers,
+devinfo (IMEIs masked unless `--show-identifiers`), FBPK, sparse, device-tree
+tables, ELF, GPT, ext4, f2fs, erofs, super metadata, Tensor boot-chain stages,
+blank images and unrecognized ones. Any IMEI-shaped number with a valid check
+digit is listed per partition. `report.json` is saved next to the images.
+
+From Android it reads `/dev/block/by-name` with `dd` and needs root. From
+fastboot (`--fastboot`, or when the phone is only in fastboot) it uses
+`fastboot fetch` (slotted partitions as `--slot a fetch boot`), which the
+bootloader usually refuses; fastbootd
+(`fastboot reboot fastboot`) allows it for some partitions. Refusals are
+listed under `unreadable`. Nothing is written to the phone.
 
 ## Upstream source tools
 
@@ -73,10 +144,11 @@ not code incorporated under this project's MIT license. Shannon is GPL-3.0.
 ## Back up before preparing a repair
 
 Root must already be available and granted to the ADB shell. This tool does not
-root, unlock, factory-reset, flash firmware, switch slots, or change bootmode.
+root, unlock, factory-reset, switch slots, or change bootmode; firmware is only
+flashed by `reflash-radio --apply` (below).
 
 ```sh
-pixel-restore modem backup --serial YOUR_ADB_SERIAL --out .pixel-restore/backups/before-repair
+pixel-restore modem backup --out .pixel-restore/backups/before-repair
 pixel-restore modem verify-backup .pixel-restore/backups/before-repair
 ```
 
@@ -117,8 +189,7 @@ pixel-restore modem prepare \
   --backup .pixel-restore/backups/before-repair \
   --original-imeis .pixel-restore/original-imeis.json \
   --out .pixel-restore/plans/restore-original
-pixel-restore modem restore-devinfo --serial YOUR_ADB_SERIAL \
-  --plan .pixel-restore/plans/restore-original
+pixel-restore modem restore-devinfo --plan .pixel-restore/plans/restore-original
 ```
 
 Both commands leave the phone unchanged. Preparation validates the complete
@@ -138,8 +209,7 @@ Only after reviewing the plan, confirming the original identifiers and accepting
 unverified build compatibility, the explicit write command is:
 
 ```sh
-pixel-restore modem restore-devinfo --serial YOUR_ADB_SERIAL \
-  --plan .pixel-restore/plans/restore-original \
+pixel-restore modem restore-devinfo --plan .pixel-restore/plans/restore-original \
   --apply --confirm-original-imeis --allow-unverified-build
 ```
 
@@ -150,6 +220,66 @@ verifies the resulting device hash. It never automatically reboots. A failed
 write/readback is reported as failure, not success; keep the backup and investigate
 before rebooting. There is no automatic rollback that could conceal a partial
 write. After a successful write, reboot manually, retry sign-in and diagnose again.
+
+### From fastboot, without root
+
+A phone that will not boot Android, or has no root, can take the same reviewed
+plan from the bootloader. The bootloader must already be unlocked.
+
+```sh
+pixel-restore modem restore-devinfo --plan .pixel-restore/plans/restore-original \
+  --apply --confirm-original-imeis --allow-unverified-build --fastboot --no-readback
+```
+
+It checks the plan and backup exactly as above, that the phone in fastboot has
+the plan's serial and model, that the bootloader is unlocked and, when the
+bootloader reports it, that `devinfo` is the size of the prepared image. Then it
+runs `fastboot flash devinfo` and nothing else. Fastboot cannot read partitions,
+so the live-hash check (is the plan stale?) and the readback verification are
+impossible here; `--no-readback` is the explicit acknowledgement. Make the
+backup and plan fresh, from the phone's current state, before using it.
+
+## Reflash the modem firmware from fastboot
+
+A missing baseband after a flash usually means the radio image does not match
+the bootloader build. This rewrites the modem firmware only; the IMEI lives in
+devinfo/efs/persist, which it does not touch.
+
+```sh
+pixel-restore modem reflash-radio --image komodo-xxxx-factory-xxxx.zip          # dry run
+pixel-restore modem reflash-radio --image komodo-xxxx-factory-xxxx.zip --apply
+```
+
+`--image` takes `radio-*.img` or the factory ZIP (the radio is extracted to
+`--out`). It refuses a radio for another model or a locked bootloader, prints
+the current bootloader and baseband, and with `--apply` flashes `radio`, reboots
+into the bootloader and fails if the baseband it then reports is not the one
+flashed. Use the factory image whose bootloader the phone is running.
+
+## Lowest build the phone still accepts
+
+For phones with no public USB-bootable BL1 (Pixel 6, 9 and 10 families), the
+fallback is reinstalling an older bootloader and radio from fastboot. Going
+below the phone's anti-rollback level can leave it in ROM recovery with no way
+out, so `arb::lowest_safe()` in `src/arb.rs` picks the target (and
+`arb::verdict()` checks any one build):
+
+- The phone's level is that of the bootloader it is running
+  (`fastboot getvar version-bootloader`), located in a listed factory image by
+  the `bootloader-<product>-<version>.img` name inside the ZIP. A bootloader no
+  listed image carries (beta, OTA-only) is refused, not guessed.
+- `arb::BUMPS` lists the months Google announced a bump: Pixel 6/6 Pro/6a in Aug
+  2022 and May 2025, Pixel 8/8 Pro/8a in May 2025, Pixel 10 series in May 2026.
+  The floor is the latest bump at or before the phone's build; the answer is
+  the oldest generic (non-carrier) image at or above it.
+- The factory image page is read for "anti-roll back" warnings. One naming the
+  phone's family in a month the table lacks, or a page with no such warnings at
+  all, stops the selection until the table is updated.
+
+What this cannot see is a bump Google never announced. Flash the current slot
+first, reboot to the bootloader and confirm `version-bootloader` before
+writing the radio and the other slot; an inactive slot below the level bricks
+the phone if it ever falls back to it.
 
 EFS/NV repair, cpsha rewriting, unknown helper binaries, and bootloader unlocks
 remain outside this command. If devinfo already contains the right values or

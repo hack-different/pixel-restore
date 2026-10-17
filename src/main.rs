@@ -1,3 +1,4 @@
+mod arb;
 mod devices;
 mod dnw;
 mod eub;
@@ -8,6 +9,7 @@ mod firmware;
 mod modem;
 mod packs;
 mod remotezip;
+mod restore;
 mod stages;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
@@ -63,6 +65,10 @@ enum Cmd {
     },
     /// Feed bootloader stages to the phone until it reaches fastboot.
     Boot(BootArgs),
+    /// From fastboot, install the lowest factory build that takes, starting
+    /// at the phone's own bootloader version. Downloads are cached; nothing
+    /// is flashed without --apply.
+    Restore(restore::RestoreArgs),
     /// List every Tensor Pixel, its SoC, and whether it can be booted from
     /// ROM recovery with what is publicly available.
     Models,
@@ -235,6 +241,7 @@ fn run() -> Result<()> {
         Cmd::Detect { all, wait } => detect(all, wait),
         Cmd::Unpack { image, out } => unpack(&image, out.as_deref()),
         Cmd::Boot(args) => boot(args),
+        Cmd::Restore(args) => restore::run(args),
         Cmd::Models => {
             models();
             Ok(())
@@ -442,17 +449,7 @@ fn models() {
         "{:<10} {:<18} {:<8} {:<10} {:<11} status",
         "codename", "model", "soc", "tensor", "pack"
     );
-    for m in devices::MODELS {
-        println!(
-            "{:<10} {:<18} {:<8} {:<10} {:<11} {}",
-            m.codename,
-            m.name,
-            m.soc.name,
-            m.soc.tensor,
-            m.pack.unwrap_or("-"),
-            m.support.label()
-        );
-    }
+    // Oldest first: the Qualcomm Pixels (1 to 5a) came before Tensor.
     for q in devices::QUALCOMM_MODELS {
         println!(
             "{:<10} {:<18} {:<8} {:<10} {:<11} {}",
@@ -462,6 +459,17 @@ fn models() {
             "Qualcomm",
             "-",
             devices::QUALCOMM_STATUS
+        );
+    }
+    for m in devices::MODELS {
+        println!(
+            "{:<10} {:<18} {:<8} {:<10} {:<11} {}",
+            m.codename,
+            m.name,
+            m.soc.name,
+            m.soc.tensor,
+            m.pack.unwrap_or("-"),
+            m.support.label()
         );
     }
     println!(

@@ -117,7 +117,7 @@ impl Image {
 
     /// Sort key: the YYMMDD in the middle of the build id, then its suffix,
     /// so newer builds compare greater regardless of the leading tag.
-    fn build_key(&self) -> (u32, u32) {
+    pub fn build_key(&self) -> (u32, u32) {
         let mut parts = self.build.split('.');
         let _tag = parts.next();
         let date = parts.next().and_then(|d| d.parse().ok()).unwrap_or(0);
@@ -188,6 +188,16 @@ pub fn parse_images(html: &str, device: &str) -> Vec<Image> {
     found
 }
 
+/// Whether a row is a carrier- or region-specific variant of a build.
+pub fn is_carrier(i: &Image) -> bool {
+    let d = i.description.to_ascii_lowercase();
+    [
+        "verizon", "t-mobile", "at&t", "telstra", "softbank", "kddi", "docomo", "emea", "jp", "tw",
+    ]
+    .iter()
+    .any(|c| d.contains(&format!("({c}")) || d.contains(&format!(", {c}")))
+}
+
 /// The newest image for a device, skipping carrier-specific rows unless
 /// nothing else exists.
 pub fn pick_latest<'a>(images: &'a [Image], build: Option<&str>) -> Option<&'a Image> {
@@ -195,15 +205,6 @@ pub fn pick_latest<'a>(images: &'a [Image], build: Option<&str>) -> Option<&'a I
         let b = b.to_ascii_lowercase();
         return images.iter().rev().find(|i| i.build == b);
     }
-    let is_carrier = |i: &Image| {
-        let d = i.description.to_ascii_lowercase();
-        [
-            "verizon", "t-mobile", "at&t", "telstra", "softbank", "kddi", "docomo", "emea", "jp",
-            "tw",
-        ]
-        .iter()
-        .any(|c| d.contains(&format!("({c}")) || d.contains(&format!(", {c}")))
-    };
     let generic: Vec<&Image> = images.iter().filter(|i| !is_carrier(i)).collect();
     let pool = if generic.is_empty() {
         images.iter().collect()
@@ -226,6 +227,15 @@ pub(crate) fn agent() -> ureq::Agent {
 
 /// Download the listing page and return the images for `device`.
 pub fn list_images(device: &str) -> Result<Vec<Image>> {
+    let images = parse_images(&listing_html()?, device);
+    if images.is_empty() {
+        bail!("no factory images for '{device}' on {IMAGES_PAGE}; check the codename");
+    }
+    Ok(images)
+}
+
+/// The listing page's HTML, terms already acknowledged.
+pub fn listing_html() -> Result<String> {
     eprintln!("reading {IMAGES_PAGE} ...");
     let mut resp = agent()
         .get(IMAGES_PAGE)
@@ -237,17 +247,11 @@ pub fn list_images(device: &str) -> Result<Vec<Image>> {
         "listing page returned HTTP {}",
         resp.status()
     );
-    let html = resp
-        .body_mut()
+    resp.body_mut()
         .with_config()
         .limit(256 * 1024 * 1024)
         .read_to_string()
-        .context("reading the factory image listing")?;
-    let images = parse_images(&html, device);
-    if images.is_empty() {
-        bail!("no factory images for '{device}' on {IMAGES_PAGE}; check the codename");
-    }
-    Ok(images)
+        .context("reading the factory image listing")
 }
 
 /// Byte-range reads over HTTP, for pulling one file out of the ZIP.
@@ -396,15 +400,15 @@ pub fn fetch_full(image: &Image, out_dir: &Path) -> Result<PathBuf> {
     let mut hasher = Sha256::new();
     let mut have = 0u64;
     if path.is_file() {
-        let existing = std::fs::read(&path)?;
-        if existing.len() as u64 > total {
+        // Stream it: a finished factory ZIP is several GB.
+        have = std::fs::metadata(&path)?.len();
+        if have > total {
             bail!(
                 "{} is larger than the server's copy; delete it and retry",
                 path.display()
             );
         }
-        hasher.update(&existing);
-        have = existing.len() as u64;
+        std::io::copy(&mut std::fs::File::open(&path)?, &mut hasher)?;
         if have > 0 && have < total {
             eprintln!(
                 "resuming {} at {:.1}%",
