@@ -12,16 +12,11 @@ is much faster for a full platform tree.
 ## Which source tree
 
 komodo (Pixel 9 Pro XL) is **not** buildable from plain AOSP — AOSP has no
-komodo device config or kernel. Two realistic bases:
-
-- **GrapheneOS** — officially supports komodo; follow grapheneos.org/build to
-  `repo init`/`repo sync` its tree and set up the komodo target. Recommended.
-- **AOSP + Google's Pixel device/vendor binaries** for komodo, if you maintain
-  such a tree.
-
-The `bootable/recovery` patch is cut against GrapheneOS `17`; the `system/core`
-patch against AOSP `main`. `scripts/apply-patches.sh` dry-runs first and tells
-you if your tree differs so you can apply by hand.
+komodo device config or kernel. The build uses **GrapheneOS**, which supports
+komodo and generates the Pixel vendor files with its `adevtool`. Both patches
+apply cleanly to GrapheneOS `17`. `scripts/apply-patches.sh` dry-runs first,
+skips a patch that is already applied, and stops without changing anything if
+your tree differs.
 
 Build **userdebug**. It defines `FB_ENABLE_FETCH` (so `fetch` is compiled in)
 and keeps the recovery and fastbootd processes able to share the tmpfs policy
@@ -30,22 +25,45 @@ file.
 ## Build
 
 ```sh
-# one-time: sync a komodo-capable tree per GrapheneOS/AOSP docs, into $SRC
-SRC=/path/to/tree LUNCH_TARGET=komodo-userdebug ./docker/build.sh
+./docker/build.sh
 ```
 
-`build.sh` builds the image, applies the patches in the container, then runs
-`m fastbootd recovery bootimage vendorbootimage`. Outputs land in
-`$OUT` (`.../out/target/product/komodo`): `boot.img`, `vendor_boot.img`.
+That one command builds the container, then inside it
+(`scripts/container-build.sh`):
 
-Verify the patch is actually in the binary (no phone involved):
+1. `repo init -u https://github.com/GrapheneOS/platform_manifest.git -b 17`
+   and `repo sync` (retried up to three times; an interrupted sync resumes).
+2. `adevtool generate-all -d komodo`, which downloads the stock factory image
+   and extracts the vendor files. This runs once per manifest revision.
+3. `repo start fastbootd-read` on `system/core` and `bootable/recovery`, then
+   applies the two patches there.
+4. `lunch komodo-cur-userdebug` and
+   `m fastbootd recovery bootimage vendorbootimage vendorkernelbootimage`.
+5. Runs `scripts/make-boot-image.sh`, which greps the built
+   `fastbootd`/recovery ramdisk for the patched string and fails loudly if the
+   rebuild did not take.
+6. Copies `boot.img`, `vendor_boot.img`, `vendor_kernel_boot.img`, the
+   `fastbootd` binary and a pinned `manifest.xml` to
+   `fastbootd-read/out/komodo/`.
+
+The tree lives in the Docker volume `fastbootd-read-src`. On a Mac that matters:
+it is a case-sensitive Linux filesystem, which AOSP needs and a normal APFS
+folder is not. Raise Docker Desktop's limits first (Settings > Resources): disk
+to about 300 GB and memory to 32 GB or more. The first run takes hours,
+especially under amd64 emulation on Apple Silicon.
+
+Useful variables (all listed at the top of `docker/build.sh`):
 
 ```sh
-OUT=/path/to/tree/out/target/product/komodo ./scripts/make-boot-image.sh
+TAG=<release tag> ./docker/build.sh   # a release instead of branch 17; the tag signature is verified
+SYNC=0 ./docker/build.sh              # rebuild without re-syncing
+VENDOR=1 ./docker/build.sh            # force adevtool to regenerate vendor files
+SRC=/path/on/linux ./docker/build.sh  # keep the tree in a host directory instead
+./docker/build.sh shell               # a shell in the container, tree at /aosp
 ```
 
-It greps the built `fastbootd`/recovery ramdisk for the patched string and
-fails loudly if the rebuild did not take.
+Re-runs are incremental: before re-syncing, the patches are reverted so repo
+can update `system/core` and `bootable/recovery`, then they are applied again.
 
 ## Boot it TEMPORARILY (no flash)
 
