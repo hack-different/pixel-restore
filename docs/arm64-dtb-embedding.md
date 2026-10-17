@@ -82,11 +82,25 @@ Possible in principle, none supported:
    writing a mini bootloader. It works for RAM boot because the kernel is the
    one thing `fastboot boot` does take from us. Brittle and only worth it if
    we need a DT the phone does not have.
-2. **Patching the kernel's early FDT path.** A local patch to
-   `setup_machine_fdt()` could ignore `x0` and use a blob linked into
-   `.init.rodata`. Same fixup problem as above, and it makes the kernel
-   diverge from AD1A source, which undercuts the forensic "from source"
-   argument.
+2. **Patching the kernel (most practical if we need a custom DT).** We
+   build the kernel, so a local patch can add a build-time option (it cannot
+   be a command-line flag: bootargs live in the DT's `/chosen`, so nothing on
+   the command line is readable before the DT is chosen). Sketch, roughly
+   100-200 lines in `arch/arm64/kernel/setup.c` plus an `.incbin` of the
+   blob:
+   - keep the normal early scan of the bootloader's `x0` DTB, so memory,
+     `/chosen` (bootargs, bootconfig, `androidboot.*`), KASLR/RNG seeds and
+     reserved-memory come from the real fixed-up tree;
+   - after `arm64_memblock_init()` has reserved memory, point
+     `initial_boot_params` at the embedded blob (with `/chosen` copied over
+     via libfdt) just before `unflatten_device_tree()`, so drivers bind
+     against our tree;
+   - the embedded blob must keep the same `/reserved-memory` carve-outs,
+     so it should start from the phone's real final DT, not one rebuilt
+     from source. Get it by RAM-booting once with the stock DT and dumping
+     `/sys/firmware/fdt` from our fastbootd: that captures the dtbo overlay
+     and every bootloader fixup.
+   Cost: the kernel diverges from AD1A source by one small, auditable patch.
 3. **Initramfs / first-stage init.** Too late: the DT is unflattened in
    `setup_arch()`, long before the initramfs is unpacked, and every
    platform driver binds against it. Init cannot replace the base DT.
@@ -121,7 +135,7 @@ replacing the device tree.
 - Only if we need a DT change (a node the stock DTB lacks, a disabled
   device) is embedding relevant. In order of preference: a runtime overlay
   for additive changes; otherwise route (B) and flash a modified
-  `vendor_boot`/`dtbo` with a stock backup; the shim in 4.1 only if a
+  `vendor_boot`/`dtbo` with a stock backup; a kernel patch (4.2) or the shim (4.1) only if a
   no-write path is mandatory.
 
 ## Sources
