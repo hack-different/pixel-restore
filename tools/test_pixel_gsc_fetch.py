@@ -337,9 +337,11 @@ class HttpTests(unittest.TestCase):
             g.main(["unique", "--out", str(out), "--dest", str(ec), "--kinds", "gsc,bin"])
             eidx = json.loads((ec / "index.json").read_text())
             self.assertEqual({b["kind"] for b in eidx["blobs"]}, {"gsc"})
+            def uname(b):  # d3m2.ec.bin -> d3m2.ec-<sha12>.bin; the FBPK partition "d3m2" -> d3m2-<sha12>
+                stem, dot, ext = b["name"].rpartition(".")
+                return f"{stem}-{b['sha256'][:12]}.{ext}" if stem else f"{ext}-{b['sha256'][:12]}"
             self.assertEqual(sorted(p.name for p in ec.iterdir() if p.suffix != ".json"),
-                             sorted(f"{b['name'].rsplit('.', 1)[0]}-{b['sha256'][:12]}.{b['name'].rsplit('.', 1)[1]}"
-                                    for b in eidx["blobs"]))
+                             sorted(uname(b) for b in eidx["blobs"]))
             self.assertTrue(all(Path(b["path"]).is_absolute() and Path(b["path"]).is_file() for b in eidx["blobs"]))
             g.main(["unique", "--out", str(out), "--prune"])
             self.assertFalse((out / same[0]["path"]).exists())
