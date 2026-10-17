@@ -3,6 +3,7 @@ mod devices;
 mod dnw;
 mod eub;
 mod fastboot;
+mod fastbootd;
 mod fbpk;
 mod fetch;
 mod firmware;
@@ -108,6 +109,11 @@ enum Cmd {
     /// `oem gsc reset`, refusing anything older than the chip runs unless
     /// --allow-downgrade. Nothing is sent without --apply.
     Titan(titan::TitanArgs),
+    /// Boot the read-enabled fastbootd built in fastbootd-read/ from RAM:
+    /// `fastboot boot fastbootd-boot.img` from the bootloader, then check
+    /// that the patched fastbootd came up. Nothing is flashed; a reboot
+    /// undoes it.
+    Fastbootd(fastbootd::FastbootdArgs),
 }
 
 #[derive(Args)]
@@ -262,6 +268,7 @@ fn run() -> Result<()> {
         } => fetch_cmd(&device, build.as_deref(), full, list, url.as_deref(), &out),
         Cmd::RepairModem(args) => repair_modem(args),
         Cmd::Titan(args) => titan::run(args),
+        Cmd::Fastbootd(args) => fastbootd::run(args),
     }
 }
 

@@ -122,6 +122,28 @@ impl Device {
         self.checked(&["stage", &path])
     }
 
+    /// `fastboot boot <image>`: load a boot image into RAM and start it.
+    /// Nothing is flashed.
+    pub fn boot(&self, image: &Path) -> Result<()> {
+        let path = image.to_string_lossy();
+        self.checked(&["boot", &path])
+    }
+
+    /// `fastboot fetch <partition> <file>`: whether it succeeded, and
+    /// everything it printed (a refusal's reason is in the text).
+    pub fn fetch(&self, partition: &str, file: &Path) -> Result<(bool, String)> {
+        let path = file.to_string_lossy();
+        let out = run(&["-s", &self.serial, "fetch", partition, &path])?;
+        let text = String::from_utf8_lossy(&out.stderr).into_owned()
+            + &String::from_utf8_lossy(&out.stdout);
+        Ok((out.status.success(), text))
+    }
+
+    /// Whether this phone is in fastboot (or fastbootd) right now.
+    pub fn present(&self) -> Result<bool> {
+        Ok(devices()?.contains(&self.serial))
+    }
+
     pub fn reboot_bootloader(&self) -> Result<()> {
         self.checked(&["reboot-bootloader"])
     }

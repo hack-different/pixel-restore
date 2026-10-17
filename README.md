@@ -159,6 +159,23 @@ lifts that. Google's listing, each candidate's bootloader and the full
 ZIPs are cached in `~/Library/Caches/pixel-restore/images/` (or
 `$PIXEL_RESTORE_CACHE/images/`); downloads resume and are SHA-256 checked.
 
+### Boot the read-enabled fastbootd (RAM only)
+
+```sh
+pixel-restore fastbootd --dry-run      # checks only: unlocked, in the bootloader, image fits
+pixel-restore fastbootd                # fastboot boot fastbootd-read/out/<product>/fastbootd-boot.img
+pixel-restore fastbootd --image X.img --serial S --wait 300
+```
+
+From the bootloader (not fastbootd), `fastbootd` sends one
+`fastboot boot` of the image that `fastbootd-read/docker/build.sh` builds,
+then waits for the phone to come back and tells you what it came back as:
+the patched fastbootd (its `fetch` refusal names the on-screen menu), the
+stock one, Android, or the bootloader again. Nothing is flashed, and a
+reboot returns the phone to what is installed. It refuses a locked phone,
+an image built for another product, and one bigger than
+`max-download-size`. See `fastbootd-read/docs/build-and-boot.md`.
+
 ### Other commands
 
 ```sh
