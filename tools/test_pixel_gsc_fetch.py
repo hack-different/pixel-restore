@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import struct
 import sys
 import tempfile
@@ -324,6 +325,33 @@ class HttpTests(unittest.TestCase):
             self.assertEqual(len(bl[0]["releases"]), 2)
             # The carrier build 404s on the test server and is recorded as an error.
             self.assertIn("error", man["images"]["komodo-cp3a.260905.009.v1-factory-deadbeef.zip"])
+
+
+@unittest.skipUnless(shutil.which("mke2fs"), "mke2fs not installed")
+class VendorTests(unittest.TestCase):
+    def test_citadel_inside_vendor_img(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d, "root", "firmware", "citadel")
+            root.mkdir(parents=True)
+            ec = bytes([0xFE, 0xFF, 0xFF, 0xFF]) + bytes(range(256)) * 300
+            (root / "ec.bin").write_bytes(ec)
+            (root / "ec.rec").write_bytes(b":10" + b"B" * 5000)
+            Path(d, "root", "firmware", "other.txt").write_text("no")
+            img = Path(d, "vendor.img")
+            subprocess.run(["mke2fs", "-q", "-t", "ext4", "-d", str(Path(d, "root")), str(img), "8M"],
+                           check=True, capture_output=True)
+            inner = make_zip([("vendor.img", img.read_bytes()), ("boot.img", b"boot")])
+            outer = make_zip([("blueline-x/bootloader-blueline-1.img", b"nope"),
+                              ("blueline-x/image-blueline-x.zip", inner)], stored=("blueline-x/image-blueline-x.zip",))
+            path = Path(d, "factory.zip")
+            path.write_bytes(outer)
+            hits, notes = g.walk_zip(g.FileRange(str(path)), "f.zip", False, 16 << 20, kinds=("gsc", "vendor"))
+            self.assertEqual(sorted(h.where for h in hits), [
+                "f.zip:image-blueline-x.zip:vendor.img:/firmware/citadel/ec.bin",
+                "f.zip:image-blueline-x.zip:vendor.img:/firmware/citadel/ec.rec"])
+            self.assertEqual(next(h.data for h in hits if h.where.endswith("ec.bin")), ec)
+            self.assertTrue(all(h.kind == "gsc" for h in hits))
 
 
 if __name__ == "__main__":

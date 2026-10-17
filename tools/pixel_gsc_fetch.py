@@ -30,6 +30,8 @@ are done here with urllib, so no dependency is needed.
 """
 import argparse
 import concurrent.futures
+import importlib.util
+import tempfile
 import hashlib
 import io
 import json
@@ -436,7 +438,17 @@ class Hit:
         self.size = len(data)
 
 
-KINDS = ("gsc", "bin", "bootloader", "radio")
+KINDS = ("gsc", "bin", "bootloader", "radio", "vendor")
+# Firmware paths inside the vendor filesystem (Pixel 3-5 keep the Citadel
+# firmware there; Tensor vendors may carry copies too).
+VENDOR_ROOT = "/firmware"
+
+
+def android_fs():
+    spec = importlib.util.spec_from_file_location("android_fs", Path(__file__).with_name("android_fs.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def kind_of(name, kinds):
@@ -452,6 +464,8 @@ def kind_of(name, kinds):
         return "bootloader"
     if "radio" in kinds and base.startswith("radio") and base.endswith(".img"):
         return "radio"
+    if "vendor" in kinds and base in ("vendor.img", "super.img"):
+        return "vendor"
     return None
 
 
@@ -472,7 +486,9 @@ def walk_zip(src, label, stream_nested, max_size, log_members=False, kinds=("gsc
         if kind in ("gsc", "bin") and m.usize > max_size:
             notes.append(f"{m.name}: {m.usize} bytes is over --max-size, skipped")
             kind = None
-        if kind:
+        if kind == "vendor":
+            hits += vendor_hits(src, m, label)
+        elif kind:
             data = extract(src, m)
             hits.append(Hit(f"{label}:{m.name}", data, kind, m))
             if kind in ("bootloader", "radio") and "gsc" in kinds:
@@ -508,6 +524,30 @@ def walk_zip(src, label, stream_nested, max_size, log_members=False, kinds=("gsc
 def is_fbpk(name):
     base = name.rsplit("/", 1)[-1].lower()
     return base.endswith(".img") and base.startswith(("bootloader", "radio"))
+
+
+def vendor_hits(src, m, label):
+    """GSC firmware under /firmware inside a vendor.img or super.img member:
+    the member is streamed to a temporary file (it is deflated, so there is
+    no way around reading it whole), then walked as sparse/LP + ext4/erofs."""
+    afs = android_fs()
+    log(f"  streaming {m.base} ({m.csize / 1e6:.0f} MB) to read {VENDOR_ROOT} ...")
+    hits = []
+    with tempfile.NamedTemporaryFile(prefix="gsc-vendor-", suffix=".img", delete=True) as tmp:
+        extract(src, m, tmp)
+        tmp.flush()
+        inner = FileRange(tmp.name)
+        img = afs.Range()
+        img.len, img.read = inner.len, inner.read
+        try:
+            if m.base.lower() == "super.img":
+                img, _ = afs.vendor_from_super(img)
+            for path, size, reader in afs.find_files(img, lambda p: True, VENDOR_ROOT):
+                if path.lower().endswith((".bin", ".rec", ".hex")):
+                    hits.append(Hit(f"{label}:{m.base}:{path}", reader(), "gsc" if is_gsc(path) else "bin"))
+        except afs.Error as e:
+            log(f"  {m.base}: {e}")
+    return hits
 
 
 # Titan M firmware carries a build tag as text and a Cr50-style SignedHeader
@@ -628,11 +668,12 @@ def cmd_list(args):
         src = open_source(args.image)
         log(f"{args.image}: {src.len / 1e9:.2f} GB")
         hits, notes = walk_zip(src, args.image.rsplit('/', 1)[-1], args.stream_nested,
-                               args.max_size, log_members=True)
+                               args.max_size, log_members=True,
+                               kinds=tuple(k.strip() for k in args.kinds.split(",")))
     except (OSError, ValueError, struct.error, urllib.error.URLError) as e:
         fail(f"{args.image}: {e}")
     for h in hits:
-        log(f"GSC: {h.where} ({len(h.data)} bytes, sha256 {h.sha256[:16]}...)")
+        log(f"{h.kind}: {h.where} ({len(h.data)} bytes, sha256 {h.sha256})")
     for n in notes:
         log(f"note: {n}")
     log(f"{src.bytes_read / 1e6:.1f} MB transferred")
@@ -910,6 +951,7 @@ def main(argv=None):
     l.add_argument("image")
     l.add_argument("--stream-nested", action="store_true", help="read through a deflated image-*.zip")
     l.add_argument("--max-size", type=int, default=16 << 20, help="largest firmware file to pull (bytes)")
+    l.add_argument("--kinds", default="gsc", help=f"kinds to look for: {', '.join(KINDS)} (default gsc)")
     l.set_defaults(func=cmd_list)
     ls = sub.add_parser("listings", help="save every indexed image's file list as <out>/<codename>/<build>.json")
     ls.add_argument("--index", required=True, help="JSON from `index`")
@@ -931,8 +973,9 @@ def main(argv=None):
     f.add_argument("--index", required=True, help="JSON from `index`")
     f.add_argument("--out", required=True, help="folder for <codename>/<build>/... and manifest.json")
     f.add_argument("--device", action="append", help="only these codenames or names (repeatable)")
-    f.add_argument("--kinds", default=",".join(KINDS),
-                   help=f"comma-separated kinds to pull: {', '.join(KINDS)} (default all)")
+    f.add_argument("--kinds", default="gsc,bin,bootloader,radio",
+                   help=f"comma-separated kinds to pull: {', '.join(KINDS)}; `vendor` streams the whole "
+                        "vendor.img/super.img to read /firmware inside it (default gsc,bin,bootloader,radio)")
     f.add_argument("--no-carriers", action="store_true", help="skip carrier-specific builds")
     f.add_argument("--gsc-all", action="store_true", help="also read devices with no known GSC")
     f.add_argument("--limit", type=int, help="only the newest N images (for a trial run)")
