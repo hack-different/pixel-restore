@@ -1,5 +1,5 @@
 diff --git a/bootable/recovery/fastboot/fastboot.cpp b/bootable/recovery/fastboot/fastboot.cpp
-index fd7b5f1..335007f 100644
+index fd7b5f1..46ed5df 100644
 --- a/bootable/recovery/fastboot/fastboot.cpp
 +++ b/bootable/recovery/fastboot/fastboot.cpp
 @@ -29,6 +29,41 @@
@@ -44,7 +44,7 @@ index fd7b5f1..335007f 100644
  static const std::vector<std::pair<std::string, Device::BuiltinAction>> kFastbootMenuActions{
    { "Reboot system now", Device::REBOOT_FROM_FASTBOOT },
    { "Enter recovery", Device::ENTER_RECOVERY },
-@@ -87,20 +122,51 @@ Device::BuiltinAction StartFastboot(Device* device, const std::vector<std::strin
+@@ -87,20 +122,52 @@ Device::BuiltinAction StartFastboot(Device* device, const std::vector<std::strin
      LOG(ERROR) << "Failed to clear BCB message: " << err;
    }
  
@@ -74,7 +74,7 @@ index fd7b5f1..335007f 100644
 +    std::transform(kFastbootMenuActions.cbegin(), kFastbootMenuActions.cend(),
 +                   std::back_inserter(fastboot_menu_items),
 +                   [](const auto& entry) { return entry.first; });
-+    fastboot_menu_items.push_back("Enable reading (fetch any partition)");
++    fastboot_menu_items.push_back("Enable reading (fetch or hash any partition)");
 +    fastboot_menu_items.push_back("Enable all partitions (also lift size limit)");
 +
 +    auto chosen_item = ui->ShowMenu(
@@ -91,9 +91,10 @@ index fd7b5f1..335007f 100644
 +    if (chosen_item == kEnableReadingItem) {
 +      ConfirmAndEnableFetch(device, kFetchReadAll,
 +                            { "ENABLE READING ALL PARTITIONS?", "",
-+                              "This lets the connected computer read the full",
-+                              "contents of ANY partition on this phone over USB,",
-+                              "including device identifiers and user data.", "",
++                              "This lets the connected computer read (or SHA-hash)",
++                              "the full contents of ANY partition on this phone",
++                              "over USB, including device identifiers and user",
++                              "data.", "",
 +                              "It never writes to the phone." });
 +      continue;
 +    }

@@ -158,5 +158,9 @@ pick "Yes, enable reading". Then on the Mac:
 
   ./scripts/read-partitions.sh --serial $serial ~/pixel-partitions
 
+or hash them on the phone without transferring them:
+
+  ./scripts/hash-partitions.sh --serial $serial
+
 When you are done, reboot the phone; the read-enabled fastbootd is gone.
 EOF

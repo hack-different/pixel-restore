@@ -52,6 +52,31 @@ The default is always stock. The policy can only be widened from the phone's
 screen. Nothing over USB can change it — the host can only read what the owner
 has already unlocked and enabled on the device.
 
+## Hashing on the phone
+
+`fastboot oem sha256 <partition>` (also `sha1`, `sha512`) makes fastbootd read
+the whole partition itself and send back only the digest:
+
+```
+(bootloader) sha256 <lowercase hex> <partition> <size in bytes>
+```
+
+So a large partition can be compared against a backup or a factory image
+without pulling it over USB. Progress lines arrive every GiB for big ones.
+
+It uses the same gates as `fetch`, with no new toggle:
+- refused on a locked bootloader;
+- the stock allow-list (`vendor_boot*`) can always be hashed;
+- any other partition needs policy **Read all** or higher, i.e. the owner has
+  picked "Enable reading" (or "Enable all partitions") on the screen;
+- no size cap, since nothing is transferred;
+- read only: the partition is opened `O_RDONLY` through the same
+  `OpenPartition` path `fetch` uses, so logical partitions inside `super` work
+  too (use slot suffixes for slotted names, e.g. `boot_a`).
+
+The command is handled in fastbootd before the OEM command reaches the fastboot
+HAL. Any other `oem` command still goes to the HAL unchanged.
+
 ## How the toggle reaches the daemon
 
 `fastbootd` (the USB daemon, `system/core`) and the recovery UI that draws the
@@ -64,8 +89,8 @@ tmpfs state file, `/dev/fastbootd_fetch_policy`:
   it before every fetch. Any missing/garbled value reads back as `0` (stock),
   so the safe default always wins.
 
-No new `fastboot oem` command is added, so the policy is unreachable from the
-host. Building the recovery/fastbootd as **userdebug** both compiles `fetch`
+No command can change the policy, so it is unreachable from the host (the
+`oem sha*` commands only read it). Building the recovery/fastbootd as **userdebug** both compiles `fetch`
 in (gate 1) and keeps the two recovery-domain processes able to share the
 tmpfs file.
 
@@ -73,8 +98,11 @@ tmpfs file.
 
 - New: `system/core/fastboot/device/fetch_policy.{h,cpp}` — the policy enum,
   the shared path, and the fail-safe reader.
+- New: `system/core/fastboot/device/partition_hash.{h,cpp}` — `oem sha256|sha1|sha512`.
 - Patched: `system/core/fastboot/device/commands.cpp` — the three gates become
-  policy-aware; `system/core/fastboot/Android.bp` — builds `fetch_policy.cpp`.
+  policy-aware, and `OemCmdHandler` tries the hash command before the HAL;
+  `system/core/fastboot/Android.bp` — builds the two new sources and links
+  `libcrypto` (BoringSSL) into fastbootd.
 - Patched: `bootable/recovery/fastboot/fastboot.cpp` — two confirmed menu
   entries that widen the policy and then return to the menu (fastbootd keeps
   serving).

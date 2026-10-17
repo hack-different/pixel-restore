@@ -164,6 +164,18 @@ partitions**), read the warning, pick **Yes**. Then from the Mac:
 That calls the existing `pixel-restore modem read-partitions --fastboot`, which
 now gets data instead of a refusal. Everything is read only.
 
+To compare partitions without pulling them, hash them on the phone:
+
+```sh
+./scripts/hash-partitions.sh --serial 47191FDAS0056M                  # devinfo efs efs_backup modem_userdata persist
+./scripts/hash-partitions.sh --algo sha512 boot_a vendor_boot_a super # any readable partition, slot suffix included
+./scripts/hash-partitions.sh --out now.sha256 --check backup.sha256   # backup.sha256 from: sha256sum *.img
+```
+
+Each partition is one `fastboot oem sha256 <partition>`. The phone reads it and
+answers with the digest and size. The output is in `sha256sum` format, and
+`--check` exits non-zero if any digest differs.
+
 ## Reset
 
 The policy lives in a tmpfs file and the whole fastbootd is running from RAM:

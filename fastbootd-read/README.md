@@ -21,6 +21,10 @@ Cancel/confirm screen:
 - **Enable all partitions** — as above, and the size cap is lifted too, so large
   partitions (`super`, `userdata`) can be read whole.
 
+Either one also allows **hashing on the phone**:
+`fastboot oem sha256 <partition>` (or `sha1`, `sha512`) returns the digest
+without transferring the partition. `scripts/hash-partitions.sh` drives it.
+
 Both are **read only**. No flash, erase or write path is changed. The default is
 unchanged (stock three-entry allow-list). Nothing over USB can flip the toggle —
 only the person physically at the phone. Reading is still refused on a locked
@@ -35,7 +39,7 @@ fastbootd-read/
   docker/       Linux build environment (Dockerfile + build.sh) — macOS can't build AOSP
   scripts/      container-build (sync/vendor/patch/build), apply-patches,
                 verify image, make_ram_boot_image, boot-fastbootd (RAM boot),
-                read-partitions wrapper
+                read-partitions and hash-partitions wrappers
   docs/         design.md (mechanism) and build-and-boot.md (how to build + boot)
 ```
 
@@ -51,8 +55,11 @@ fastbootd-read/
 #    (`fastboot boot`, never flashes). It checks the phone first and confirms
 #    which fastbootd came up. See docs/build-and-boot.md.
 ./docker/build.sh boot
-# 3. On the phone's screen pick "Enable reading", then:
+# 3. On the phone's screen pick "Enable reading", then read partitions:
 ./scripts/read-partitions.sh --serial <serial> ~/pixel-partitions
+#    ...or just hash them on the phone (sha256sum format; --check compares
+#    against e.g. `sha256sum *.img > backup.sha256` from an earlier backup):
+./scripts/hash-partitions.sh --serial <serial> --check backup.sha256
 ```
 
 Needs Docker with about 300 GB of disk and 32 GB+ of memory for the VM. The
