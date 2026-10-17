@@ -95,22 +95,28 @@ remote one.
   the Chromebook EC / Cr50 and described in the willem 39c3 talk and the Melotti
   reversing paper (which confirms four images — two RO, two RW — with A/B
   duplication).
-- **`RO_B` at the midpoint, scaling with flash size**: confirmed by direct
-  observation on the researcher's Pixel 9 Pro XL (komodo, Dauntless, 1 MiB). An
-  inspected RO image reports `ro_base 0x00080000`, which is exactly `1024K / 2`
-  — the midpoint — with the paired RW image at `0x000a0000`.
-  - *Slot-label caveat:* those header captures were not tagged by slot. An RO
-    image reporting `ro_base 0x80000` is most consistent with the **B / upper**
-    slot (`RO_A` would report `0x0`). A re-dump tagged per slot
-    (`fastboot oem gsc header` per image, decoded by `pixel-restore titan
-    --inspect`) would make the A-vs-B attribution unambiguous.
+- **`RO_B` at the midpoint on the 1 MiB part**: confirmed from the Dauntless
+  firmware layout. A komodo `d3m2.ec.bin` is exactly 1 MiB, and its four images
+  sit at file offsets `0x0` (RO_A), `0x20000` (RW_A), `0x80000` (RO_B, exactly
+  `1024K / 2`) and `0xa0000` (RW_B). Every komodo and husky `d3m2.ec.bin` and
+  `evt.ec.bin` checked has this layout (`pixel-restore titan --inspect`).
+  - *Correction:* an earlier version of this section cited an image reporting
+    `ro_base 0x00080000` as RO_B at the midpoint. `ro_base` is the image's
+    mapped address, with the flash at `0x80000` in the chip's address space,
+    so `ro_base` = file offset + `0x80000`. `ro_base 0x80000` is **RO_A**, and
+    RO_B reports `0x100000`. The midpoint conclusion is unchanged, but it rests
+    on the file offsets above, not on that `ro_base` value.
+  - *Not shown by this:* that `RO_B` moved with the flash size from Citadel to
+    Dauntless. That needs the same layout read from a Citadel image (expected
+    RO_B at `0x40000` in 512 KiB), which this project has not checked.
 - **The cross-part RO_B→RW_A overlap and the eFUSE fix**: from the researcher's
   own reverse-engineering write-up. These specifics are not published in a Google
   advisory; the precise Citadel `RW_A` extent that `RO_B` overlaps comes from the
   RE, not a vendor table.
 
-Overall: the mechanism is confirmed and internally consistent, the size-dependent
-`RO_B` placement is corroborated by device observation, and the vendor mitigation
+Overall: the mechanism is confirmed and internally consistent, `RO_B` at the
+midpoint of the 1 MiB Dauntless flash is corroborated by the firmware layout,
+the Citadel side of the size change is not yet checked here, and the vendor mitigation
 (eFUSE) is documented by the researcher. It is **not** independently confirmed by
 a Google-published advisory.
 
@@ -122,7 +128,8 @@ overlap. (Exact build/version introducing the check is not established here.)
 
 For anyone handling these parts: do not flash firmware of one generation onto the
 other, and verify the chip generation (`gsc-flavor`) and the per-image `ro_base`
-with `pixel-restore titan --inspect` before writing anything.
+with `pixel-restore titan --inspect` before writing anything. On Dauntless,
+RO_A reports `ro_base 0x80000` and RO_B `0x100000`.
 
 ## 6. Timeline
 
