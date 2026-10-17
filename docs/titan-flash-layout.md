@@ -65,27 +65,39 @@ Google later closed this by having newer Dauntless builds **check an eFUSE that
 blocks booting Dauntless code on a Citadel** (timing unclear; from Rick's
 write-up).
 
-## What the komodo observation shows
+## What the komodo firmware shows
 
-On Rick's komodo (Dauntless, 1MB), one inspected RO image reports
-`ro_base 0x00080000` and the paired RW image `ro_base 0x000a0000`. `0x80000` is
-exactly `1024K / 2`, i.e. the midpoint — consistent with an RO region placed at
-the start of the upper half (RO_B at `flash_size/2`), with RW following at
-`0xa0000`. This is direct corroboration that RO_B sits at `flash_size/2` on the
-1MB part.
+The evidence is the layout of the full-flash image, not the `ro_base` field.
+A komodo `d3m2.ec.bin` (Dauntless) is exactly 1 MiB (0x100000), and
+`pixel-restore titan --inspect` finds its four images at these **file
+offsets**:
 
-Caveat on slot labels: those two headers were captured without a slot label, so
-an image reporting `ro_base 0x80000` is most consistent with the **B** (upper)
-slot regardless of how it was tagged at capture; RO_A would report `0x0`.
-Confirming A-vs-B definitively means re-dumping each image tagged by slot
-(`fastboot oem gsc header` per image) and reading the `ro_base` the
-`pixel-restore titan --inspect` decoder prints.
+| Image | File offset | `ro_base` |
+| --- | --- | --- |
+| RO_A | 0x00000 | 0x080000 |
+| RW_A | 0x20000 | 0x0a0000 |
+| RO_B | 0x80000 (= 1 MiB / 2) | 0x100000 |
+| RW_B | 0xa0000 | 0x120000 |
+
+RO_B starts exactly at the midpoint of the 1 MiB flash, and RO_A at 0. This
+directly corroborates the `flash_size / 2` rule on the 1 MiB part. The same
+layout holds in every komodo and husky `d3m2.ec.bin` and `evt.ec.bin` checked;
+see `docs/titan-ro-key-table.md`.
+
+`ro_base` is the image's **mapped address**: the flash appears at 0x80000 in the
+chip's address space, so `ro_base` = file offset + 0x80000. An image reporting
+`ro_base 0x80000` is therefore **RO_A**, not RO_B. An earlier version of this
+note read `ro_base 0x80000` as RO_B at the midpoint; that was a misreading. The
+midpoint conclusion stands, but on the file-offset evidence above. When reading
+the chip with `fastboot oem gsc header`, RO_A reports `ro_base 0x80000` and RO_B
+reports `0x100000`.
 
 ## Verdict
 
 The mechanism is internally consistent, matches the documented A/B-halving
 design, matches Rick's prior reverse-engineering write-up, and is directly
-corroborated by the komodo RO offset (`0x80000` = flash_size/2). It is **not**
+corroborated by the komodo firmware layout (RO_B at file offset `0x80000` =
+flash_size/2 in the 1 MiB image). It is **not**
 independently confirmed by any Google source, and the precise Citadel RW_A
 extent that RO_B overlaps is from Rick's RE, not a published table. Treat it as
 confirmed-in-mechanism, observed-offset-corroborated, Google-unconfirmed.
@@ -101,4 +113,5 @@ confirmed-in-mechanism, observed-offset-corroborated, Google-unconfirmed.
 - Melotti et al., "Reversing and Fuzzing the Google Titan M Chip" (2021)
   (four images: two RO, two RW, A/B duplication):
   https://conand.me/publications/melotti-titanm-2021.pdf
-- This project's komodo header captures (RO `ro_base 0x80000`, RW `0xa0000`).
+- This project's decode of komodo and husky `d3m2.ec.bin` and `evt.ec.bin` (RO_B at
+  file offset `0x80000` in the 1 MiB image; `ro_base` = offset + 0x80000).

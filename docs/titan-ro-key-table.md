@@ -85,8 +85,10 @@ In a full 1 MiB `d3m2.ec.bin` the four images sit at file offsets 0x0 (RO_A),
 0x20000 (RW_A), 0x80000 (RO_B) and 0xa0000 (RW_B). Their `ro_base` fields read
 0x80000, 0xa0000, 0x100000 and 0x120000. So `ro_base` is the image's address
 with the flash mapped at 0x80000, and **`ro_base 0x80000` is RO_A**, not RO_B.
-RO_B is at `ro_base 0x100000`. A header reporting `ro_base 0x80000` therefore
-does not by itself show that RO_B sits at the flash midpoint.
+RO_B is at `ro_base 0x100000`. The RO_B-at-the-midpoint layout is still true,
+but the evidence is RO_B's file offset 0x80000, not `ro_base`.
+`docs/titan-flash-layout.md` and `docs/titan-ro-rw-disclosure.md` have been
+corrected to say so.
 
 ## Not established
 
