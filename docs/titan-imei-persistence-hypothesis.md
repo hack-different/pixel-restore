@@ -12,7 +12,7 @@ write-protect bypass), `docs/titan-flash-layout.md`, `docs/titan-key-verificatio
 
 ---
 
-## 1. The two observations
+## 1. The observations
 
 1. **A bricked GSC state on a production device.** A Dauntless (Titan M2) GSC
    was observed in a bricked `0.2.2` state on a *production* phone (not a lab or
@@ -22,10 +22,19 @@ write-protect bypass), `docs/titan-flash-layout.md`, `docs/titan-key-verificatio
 2. **IMEI loss recurring more than once.** The phone's IMEI / modem identity has
    been lost repeatedly — not a single corruption event, but a pattern that
    returns after repair.
+3. **A reported ~1% population-level Titan-restore failure.** An insider is
+   reported to have claimed that roughly **1% of Pixels do not restore their
+   Titan correctly, leading to SPI errors in the recovery process.** This is an
+   *unverified single-source claim* — recorded here as a lead, not a fact — but
+   if even approximately true it means the failure mode is **not unique to this
+   device**; it is a population-level phenomenon. The working premise adopted
+   here (per the researcher) is that this device's issue is **not wholly unique**
+   and is plausibly an instance of that broader class.
 
-The question this document addresses: **are these the same adversary / the same
-class of attack, and is the IMEI recurrence the visible symptom of a persistent
-compromise rooted in the GSC?**
+The question this document addresses: **are these the same class of problem — is
+the IMEI recurrence the visible symptom of a GSC-level fault (whether a
+persistent compromise or a systemic restore/SPI failure) that the ~1% claim says
+is already happening at population scale?**
 
 ## 2. Why recurrence is the signal
 
@@ -69,6 +78,42 @@ IMEI went again after I fixed it."
 
 This is a hypothesis, not a demonstrated exploit chain. It explains the observed
 recurrence; it has not been proven on the device.
+
+## 3a. Population framing: probably not unique, and a widened differential
+
+Observation 3 (the reported ~1% Titan-restore failure with SPI errors in
+recovery) changes how to read this. If a GSC-restore failure is already
+happening to on the order of 1% of devices, then a single phone that bricks its
+Titan and loses its modem identity is most likely **an instance of a known
+class, not a bespoke one-off**. That cuts both ways and widens the differential
+to (at least) two causes that produce the *same* recurrence symptom:
+
+- **(A) Persistent compromise** in the GSC RO region (§3): rescue rewrites RW
+  only, so the fault survives and recurs. This is the "advanced attack" premise.
+- **(B) A systemic restore/SPI fault.** "SPI errors in the recovery process"
+  points at the physical layer: the GSC's firmware lives in **SPI NOR flash**,
+  and the restore/rescue path reads and writes that flash. A defect in that path
+  — e.g. mishandling the RO/RW boundary during a write, or a flash-geometry
+  assumption that is wrong for a fraction of parts (the very `flash_size/2`
+  RO_B-placement sensitivity documented in `docs/titan-ro-rw-disclosure.md`) —
+  would leave a slice of devices with a mis-restored or bricked GSC, and a
+  mis-restored RO would then keep re-manifesting after each RW-only rescue, i.e.
+  **recur the same way (A) does**.
+
+Crucially, (A) and (B) are **not mutually exclusive and can look identical from
+the outside**: the RO/RW layout confusion that enables (A) as an attack is also
+a plausible root for (B) as an accidental ~1% failure. So the population claim
+does not by itself decide attack-vs-defect — but it does say the mechanism is
+probably **shared and reproducible**, which is good news for confirmation: a
+reproducible ~1% failure can be studied across many devices, not just this one.
+
+It also means **"the keys look standard" is a baseline check that passed, not an
+all-clear** (see §4.1): the keyid pair matching the factory image rules out *that
+particular* signature, but the thing that actually differs under either (A) or
+(B) is elsewhere — an RW image that does not byte-match the genuine `68f379bd`,
+`infomap`/rollback-bit deltas, SPI-level read/write errors, or IMEI/efs/persist
+cleared with no matching reflash. Do not let a passed baseline check mask an
+anomaly in those.
 
 ## 4. What would CONFIRM it (device forensics)
 
@@ -142,6 +187,23 @@ For each image check:
   writes to modem NV that no repair step performed. `pixel-restore modem
   diagnose` and `read-partitions` already surface most of this.
 
+### 4.7 SPI-error and population signal (tests observation 3)
+- **Capture the recovery-time SPI error.** When a Titan restore/rescue fails,
+  record the exact error and the GSC console/UART output around it
+  (`docs/tensor-boot-order.md` describes the UART rescue channel). An SPI
+  read/write/verify error names *where* in the flash the restore faulted — and
+  whether that offset sits at or near the `flash_size/2` RO_B boundary is the
+  direct link to the layout issue.
+- **Correlate across devices/builds.** If the ~1% claim is real, the failures
+  should cluster — by build, by GSC version, by codename, or by the Citadel↔
+  Dauntless flash-size transition. The new `tools/pixel_gsc_fetch.py` +
+  `firmware-index.json` make it cheap to pull the factory GSC for many builds and
+  compare RO offsets/versions/keys at scale, to see whether the failing cohort
+  shares a flash-geometry or version trait.
+- A reproducible SPI fault at a predictable offset supports cause **(B)** (a
+  systemic restore/layout defect); a clean SPI path with RO *content* divergence
+  supports cause **(A)** (compromise). Both still recur through an RW-only rescue.
+
 ## 5. What would REFUTE it
 
 - Device RO images: key ids are recognized genuine keys for this part (a
@@ -150,11 +212,15 @@ For each image check:
   version at-or-above the factory build's GSC, and RO bytes matching the clean
   factory RO. **All clean ⇒ no RO compromise.**
 - IMEI stays correct after one proper repair across multiple reboots and
-  check-ins. **No recurrence ⇒ mundane corruption, not a persistent attack.**
+  check-ins. **No recurrence ⇒ mundane corruption, not a persistent fault.**
 
 If both hold, the bricked `0.2.2` was most likely a one-off corruption or a
-failed update, and the IMEI losses were independent repair/flash accidents —
-not a common adversary.
+failed update, and the IMEI losses were independent repair/flash accidents.
+Note the asymmetry introduced by §3a: clean RO content refutes cause **(A)**
+(compromise) but does **not** by itself refute cause **(B)** (a systemic
+restore/SPI defect), since (B) can leave the RO content genuine while still
+mis-restoring or faulting during recovery. Refuting the *attack* is not the same
+as refuting the *fault*.
 
 ## 6. Honest limits
 
@@ -169,13 +235,19 @@ not a common adversary.
   **not demonstrated** as an executed exploit.
 - "Advanced attack" is the adopted premise for the brick, per the researcher; it
   is not independently established in this document.
+- The ~1% Titan-restore / SPI-error figure is an **unverified, single-source
+  insider claim** (observation 3). It is used here only to justify treating the
+  issue as non-unique and to motivate population-level tests; no rate is
+  confirmed, and the number should not be quoted as established.
 
 ## 7. Next step
 
-Collect §4.1–§4.6 from the affected device (or its full backups). The single
+Collect §4.1–§4.7 from the affected device (or its full backups). The single
 most decisive datum is §4.5 (does a clean repair stick?) corroborated by §4.4
-(does the device RO match clean factory RO?). Until those exist, this remains a
-well-formed hypothesis with a clear test, not a finding.
+(does the device RO match clean factory RO?); §4.7 (the recovery-time SPI error
+and whether failures cluster) is what tests the ~1% population claim and
+separates cause (A) from (B). Until those exist, this remains a well-formed
+hypothesis with a clear test, not a finding.
 
 ---
 
