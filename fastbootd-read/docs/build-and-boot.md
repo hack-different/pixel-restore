@@ -64,6 +64,12 @@ SRC=/path/on/linux ./docker/build.sh  # keep the tree in a host directory instea
 ./docker/build.sh shell               # a shell in the container, tree at /aosp
 ```
 
+The build runs as the image's unprivileged `node` user (uid 1000), because
+adevtool refuses to run as root. On the first run, the tree from an earlier
+root-run sync is handed to that user once, which takes a few minutes for a full
+tree. If you later run commands as root in `./docker/build.sh shell`, use
+`CHOWN=1 ./docker/build.sh` to repeat that step.
+
 Re-runs are incremental: before re-syncing, the patches are reverted so repo
 can update `system/core` and `bootable/recovery`, then they are applied again.
 

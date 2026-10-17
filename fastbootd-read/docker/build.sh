@@ -28,6 +28,8 @@
 #   VARIANT       default: userdebug (it compiles `fastboot fetch` into fastbootd)
 #   LUNCH_TARGET  default: $DEVICE-cur-$VARIANT
 #   SYNC          1 = repo init + sync (default), 0 = build the tree as it is
+#   CHOWN         1 = re-give the tree to the unprivileged build user (the build
+#                 runs as `node`, uid 1000, because adevtool refuses root)
 #   VENDOR        auto (default: run adevtool once per manifest revision), 1, 0
 #   JOBS          repo sync jobs (default: 8)
 #   VOLUME        source volume name (default: fastbootd-read-src)
@@ -79,7 +81,7 @@ docker build --platform "$PLATFORM" -t fastbootd-read-builder "$here"
 tty=()
 [ -t 0 ] && [ -t 1 ] && tty=(-it)
 env_args=(-e DEVICE="$DEVICE")
-for v in BRANCH TAG MANIFEST_URL VARIANT LUNCH_TARGET SYNC VENDOR JOBS; do
+for v in BRANCH TAG MANIFEST_URL VARIANT LUNCH_TARGET SYNC VENDOR JOBS CHOWN; do
   [ -n "${!v:-}" ] && env_args+=(-e "$v=${!v}")
 done
 

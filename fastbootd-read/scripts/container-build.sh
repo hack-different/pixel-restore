@@ -25,6 +25,24 @@ PATCHES=/patches
 ART=/artifacts
 
 step() { echo; echo "==> $*"; }
+
+# adevtool refuses to run as root, and nothing else here needs root. Give the
+# tree and ccache to the image's unprivileged `node` user (uid 1000) once, then
+# run this script again as that user. CHOWN=1 repeats the ownership fix, e.g.
+# after running commands as root in `docker/build.sh shell`.
+BUILD_USER=node
+if [ "$(id -u)" = 0 ]; then
+  owned=/aosp/.fastbootd-read-owner
+  if [ "$(cat "$owned" 2>/dev/null)" != "$BUILD_USER" ] || [ "${CHOWN:-0}" = 1 ]; then
+    step "Giving /aosp and /ccache to $BUILD_USER (once; a synced tree takes a few minutes)"
+    chown -R "$BUILD_USER:$BUILD_USER" /aosp /ccache
+    echo "$BUILD_USER" > "$owned"
+    chown "$BUILD_USER:$BUILD_USER" "$owned"
+  fi
+  # A bind mount from macOS accepts writes from any uid; on Linux, own it.
+  chown "$BUILD_USER:$BUILD_USER" /artifacts 2>/dev/null || true
+  exec runuser -u "$BUILD_USER" -- env HOME="/home/$BUILD_USER" bash "$0" "$@"
+fi
 cd /aosp
 
 step "Checking resources"
