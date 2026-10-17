@@ -512,7 +512,7 @@ def is_fbpk(name):
 
 # Titan M firmware carries a build tag as text and a Cr50-style SignedHeader
 # (1024 bytes, magic fffffffd on a Titan M2) with epoch/major/minor at 860.
-TAG_RE = re.compile(rb"nugget_v\d+\.\d+\.ab(\d+)-([0-9a-f]{7,40})(?:-[a-z]+)?")
+TAG_RE = re.compile(rb"nugget_v\d+(?:\.\d+)+\.ab(\d+)-([0-9a-f]{7,40})(?:-[a-z]+)?")
 TITAN_MAGIC = (b"\xfd\xff\xff\xff", b"\xfe\xff\xff\xff")
 
 
