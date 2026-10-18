@@ -282,7 +282,9 @@ writing the radio and the other slot; an inactive slot below the level bricks
 the phone if it ever falls back to it.
 
 EFS/NV repair, cpsha rewriting, unknown helper binaries, and bootloader unlocks
-remain outside this command. If devinfo already contains the right values or
+remain outside this command. A blanked or damaged `efs`/`efs_backup` partition
+is handled by `tools/pixel_efs.py` (`docs/efs-repair.md`), which rewrites it
+from its surviving mirror or this phone's backup. If devinfo already contains the right values or
 restoring it does not resolve check-in, stop and diagnose modem/EFS state rather
 than repeatedly writing it. Hardware damage or loss of both EFS copies is not
 recoverable by the upstream restore-imei tool's stated method.
