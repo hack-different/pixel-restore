@@ -38,6 +38,7 @@ import bisect
 import bz2
 import concurrent.futures
 import hashlib
+import html as htmllib
 import importlib.util
 import io
 import json
@@ -487,6 +488,8 @@ def parse_ota_page(html):
         link_start = html.rfind("<a", 0, m.start())
         desc = g.strip_tags(html[row_start:link_start]) if 0 <= row_start < link_start else ""
         desc = re.sub(r"\s*(Link|Flash)\s*$", "", desc).strip()
+        # entities may be double-escaped on the page ("AT&amp;amp;T")
+        desc = htmllib.unescape(htmllib.unescape(desc))
         low = desc.lower()
         carrier = any(f"({c}" in low or f", {c}" in low for c in g.CARRIERS)
         entry = index.setdefault(codename, {
@@ -702,7 +705,8 @@ def cmd_fetch(args):
         done[img["file"]] = entry
         (out / code / f"{img['build']}.ota.json").write_text(json.dumps(entry, indent=2) + "\n")
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
-    log(f"manifest: {len(done)} images -> {manifest_path}")
+    moved = sum(e.get("bytes_transferred", 0) for e in done.values() if e.get("source") == "ota")
+    log(f"manifest: {len(done)} images -> {manifest_path} ({moved / 1e6:.1f} MB transferred for OTAs)")
 
 
 def main(argv=None):
