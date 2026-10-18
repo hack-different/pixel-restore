@@ -189,6 +189,38 @@ class ZipTests(unittest.TestCase):
         self.assertEqual(dict(g.fbpk_entries(BL))["d3m2"], D3M2)
         self.assertEqual(g.fbpk_entries(b"nope"), [])
 
+    def test_opentitan_and_citadel_tags(self):
+        def manifest(ident, vmaj, vmin, secver, entry, length):
+            h = bytearray(b"\xa5" * 0x400)
+            h[0x330:0x334] = struct.pack("<I", 0x739)
+            h[0x334:0x338] = ident
+            h[0x338:0x33c] = struct.pack("<HH", 0x6c47, 2)
+            h[0x33c:0x350] = struct.pack("<IIIII", length - 64, length, vmaj, vmin, secver)
+            h[0x350:0x358] = struct.pack("<Q", 1716336000)
+            h[0x358:0x378] = b"\0" * 32
+            h[0x378:0x388] = struct.pack("<IIII", 0, 0x400, length - 64, entry)
+            h[0x388:0x400] = b"\0" * 120
+            h[0x388:0x390] = struct.pack("<II", 0x94ac01ec, length - 64)
+            return bytes(h)
+        code = b"longjing_v0.0.ab15475410-4cf952d-l 2026-05-22\0" + b"\x13" * 0x800
+        rom_ext = manifest(b"OTRE", 0, 119, 2, 0x3480, 0x400 + len(code)) + code
+        bl0 = manifest(b"OTB0", 0, 16, 1, 0x428, 0x400 + len(code)) + code
+        blob = (rom_ext + bl0).ljust(0x10000, b"\xff")
+        info = g.titan_info(blob)
+        self.assertEqual(info["tag"], "longjing_v0.0.ab15475410-4cf952d-l")
+        self.assertEqual(info["build"], 15475410)
+        self.assertEqual([(h["stage"], h["version"], h["security_version"], h["chip"]) for h in info["headers"]],
+                         [("rom_ext", "0.119", 2, "opentitan"), ("bl0", "0.16", 1, "opentitan")])
+        self.assertEqual(info["headers"][0]["entry_point"], 0x3480)
+        self.assertEqual(info["headers"][0]["extensions"], ["0x94ac01ec"])
+        self.assertEqual(info["headers"][1]["offset"], len(rom_ext))
+        # a Citadel ec.bin tag, and no header
+        citadel = b"\0" * 64 + b"chunk_ab9914055-b41f6e4 2023-04-10 22:15:29 android-build\0" + b"\0" * 2048
+        info = g.titan_info(citadel)
+        self.assertEqual(info["tag"], "chunk_ab9914055-b41f6e4")
+        self.assertEqual(info["build"], 9914055)
+        self.assertNotIn("headers", info)
+
     def test_gsc_names(self):
         for n in ("firmware/d3m2.bin", "d2.rec", "vendor/firmware/citadel/ec.bin", "ec.rec",
                   "firmware/dauntless/evt.bin", "x/gsc/d3.ec.bin", "komodo-cp3a.260905.009/proto11.ec.bin",

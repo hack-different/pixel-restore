@@ -552,12 +552,46 @@ def vendor_hits(src, m, label):
 
 # Titan M firmware carries a build tag as text and a Cr50-style SignedHeader
 # (1024 bytes, magic fffffffd on a Titan M2) with epoch/major/minor at 860.
-TAG_RE = re.compile(rb"nugget_v\d+(?:\.\d+)+\.ab(\d+)-([0-9a-f]{7,40})(?:-[a-z]+)?")
+# Tags seen: nugget_v0.0.ab<build>-<hash>-r (Dauntless), longjing_v0.0.ab<build>-<hash>-l
+# (the OpenTitan-style gb00/pi01 images), chunk_ab<build>-<hash> (Citadel ec.bin).
+TAG_RE = re.compile(rb"(?:[a-z]+_v\d+(?:\.\d+)+\.|chunk_)ab(\d+)-([0-9a-f]{7,40})(?:-[a-z]+)?")
 TITAN_MAGIC = (b"\xfd\xff\xff\xff", b"\xfe\xff\xff\xff")
+# OpenTitan (earlgrey) manifest: 1024 bytes, identifier at 0x334 ("OTRE" ROM_EXT,
+# "OTB0" owner firmware / BL0), manifest_version {minor u16, major u16} at 0x338,
+# then signed_region_end, length, version_major, version_minor, security_version,
+# timestamp u64, binding value[32], max_key_version, code_start, code_end, entry_point,
+# and 15 {id, offset} extension slots up to 0x400.
+OT_IDENT = {b"OTRE": "rom_ext", b"OTB0": "bl0"}
+
+
+def opentitan_info(data):
+    """[{offset, stage, version, security_version, ...}] for every OpenTitan
+    manifest in `data` (the gb00 / pi01 "longjing" GSC images)."""
+    found = []
+    for ident, stage in OT_IDENT.items():
+        pos = data.find(ident)
+        while pos >= 0:
+            off = pos - 0x334
+            if off >= 0 and off + 0x400 <= len(data):
+                minor, major = struct.unpack("<HH", data[off + 0x338:off + 0x33c])
+                (signed_end, length, vmaj, vmin, secver) = struct.unpack("<IIIII", data[off + 0x33c:off + 0x350])
+                timestamp = struct.unpack("<Q", data[off + 0x350:off + 0x358])[0]
+                max_key, code_start, code_end, entry = struct.unpack("<IIII", data[off + 0x378:off + 0x388])
+                if major == 2 and 0x400 <= length <= len(data) - off and code_start == 0x400 and code_start <= code_end <= length:
+                    exts = [struct.unpack("<I", data[off + 0x388 + 8 * i:off + 0x38c + 8 * i])[0] for i in range(15)]
+                    found.append({"offset": off, "stage": stage, "version": f"{vmaj}.{vmin}",
+                                  "security_version": secver, "manifest_version": f"{major}.{minor:#x}",
+                                  "image_size": length, "signed_region_end": signed_end, "timestamp": timestamp,
+                                  "max_key_version": max_key, "code_start": code_start, "code_end": code_end,
+                                  "entry_point": entry, "extensions": [f"{e:#010x}" for e in exts if e],
+                                  "chip": "opentitan"})
+            pos = data.find(ident, pos + 1)
+    return sorted(found, key=lambda h: h["offset"])
 
 
 def titan_info(data):
-    """{tag, build, version} read out of a Titan firmware blob, where known."""
+    """{tag, build, headers} read out of a Titan firmware blob, where known:
+    Cr50-style SignedHeaders (Citadel / Dauntless) or OpenTitan manifests."""
     info = {}
     m = TAG_RE.search(data)
     if m:
@@ -575,6 +609,8 @@ def titan_info(data):
                                  "ro_base": ro_base, "ro_max": ro_max, "rx_base": rx_base, "rx_max": rx_max,
                                  "timestamp": timestamp, "p4cl": p4cl,
                                  "chip": "dauntless" if data[off] == 0xFD else "citadel"})
+    if not versions:
+        versions = opentitan_info(data)
     if versions:
         info["headers"] = versions
     tags = sorted({m.group(0).decode() for m in TAG_RE.finditer(data)})
