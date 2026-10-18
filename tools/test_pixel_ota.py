@@ -271,7 +271,7 @@ PAGE = '''
 <tr><td>15.0.0 (AP3A.241005.015, Oct 2024)</td>
 <td><a href="https://dl.google.com/dl/android/aosp/komodo-ota-ap3a.241005.015-5678abcd.zip">Link</a></td>
 <td>bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb</td></tr>
-<tr><td>17.0.0 (CP3A.260905.009.V1, Sep 2026, Verizon)</td>
+<tr><td>17.0.0 (CP3A.260905.009.V1, Sep 2026, Verizon, AT&amp;amp;T)</td>
 <td><a href="https://dl.google.com/dl/android/aosp/komodo-ota-cp3a.260905.009.v1-9999abcd.zip">Link</a></td>
 <td>cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc</td></tr>
 </table>
@@ -288,6 +288,7 @@ class PageTests(unittest.TestCase):
         self.assertEqual(imgs[1]["sha256"], "a" * 64)
         self.assertEqual(imgs[1]["type"], "ota")
         self.assertTrue(imgs[2]["carrier"])
+        self.assertIn("AT&T", imgs[2]["description"])
         self.assertFalse(imgs[1]["carrier"])
         self.assertEqual(idx["komodo"]["gsc"], "dauntless")
 
