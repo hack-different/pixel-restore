@@ -224,6 +224,23 @@ sense with images taken from the same phone. `--serial` is needed only when
 more than one phone is in fastboot; `$FASTBOOT` points it at a specific
 `fastboot` binary.
 
+## Repairing a blanked `efs`
+
+When a modem partition itself is gone (every byte zero, or no longer a
+filesystem), `tools/pixel_efs.py` reads `efs`, `efs_backup`, `modem_userdata`,
+`persist` and `devinfo` (through the read-enabled fastbootd or rooted adb),
+classifies each image, and prepares a plan: a blank copy is rewritten from its
+healthy mirror, else from this phone's own backup, else (only with
+`--allow-empty`) left as a zero image Android formats at boot. Nothing is
+flashed without `apply --apply`, and never from another phone's images.
+See `docs/efs-repair.md`.
+
+```sh
+python3 tools/pixel_efs.py fetch --out .pixel-restore/efs/before
+python3 tools/pixel_efs.py plan --images .pixel-restore/efs/before --out .pixel-restore/efs/plan
+python3 tools/pixel_efs.py apply --plan .pixel-restore/efs/plan --apply
+```
+
 ## How the protocol works
 
 Device → host is text, one message per line:
