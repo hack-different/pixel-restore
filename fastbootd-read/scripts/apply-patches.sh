@@ -14,6 +14,7 @@ cd "$AOSP_ROOT"
 patches=(
   "$REPO_ROOT/patches/0001-system-core-fastbootd-runtime-fetch-policy.patch"
   "$REPO_ROOT/patches/0002-bootable-recovery-fastbootd-fetch-menu.patch"
+  "$REPO_ROOT/patches/0003-system-core-init-force-recovery-marker.patch"
 )
 
 todo=()

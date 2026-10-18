@@ -1,0 +1,16 @@
+--- a/system/core/init/first_stage_init.cpp
++++ b/system/core/init/first_stage_init.cpp
+@@ -114,6 +114,13 @@
+ }
+ 
+ bool ForceNormalBoot(const std::string& cmdline, const std::string& bootconfig) {
++    // fastbootd-read: a ramdisk built into the kernel for a RAM-only `fastboot boot`
++    // carries this marker. The bootloader may still pass force_normal_boot for such a
++    // boot, but that ramdisk exists to start recovery (and fastbootd) from RAM.
++    if (access("/force_recovery", F_OK) == 0) {
++        LOG(INFO) << "/force_recovery present: ignoring androidboot.force_normal_boot";
++        return false;
++    }
+     return bootconfig.find("androidboot.force_normal_boot = \"1\"") != std::string::npos ||
+            cmdline.find("androidboot.force_normal_boot=1") != std::string::npos;
+ }
