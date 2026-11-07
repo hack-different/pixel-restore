@@ -69,6 +69,91 @@ pub struct RestoreArgs {
     /// Give up after this many builds fail to install.
     #[arg(long, default_value_t = 3)]
     attempts: usize,
+
+    /// Flash this factory image instead of picking one from Google's
+    /// listing: the factory ZIP, or the directory it unzips to (holding
+    /// bootloader-*.img and image-*.zip). Its codename and SoC are checked.
+    #[arg(long, short, conflicts_with = "build")]
+    image: Option<PathBuf>,
+}
+
+/// Products a RAM-booted recovery-pack bootloader may report instead of the
+/// real model: the gs201 pack's ABL is Google's "cloudripper" dev-board
+/// build, and a sibling ABL (husky's on an akita) says `unknown`.
+const RESCUE_PRODUCTS: &[&str] = &["unknown", "cloudripper"];
+
+/// Whether the phone is running a recovery pack's bootloader from RAM (after
+/// `pixel-restore boot`) rather than its own from storage. Such a bootloader
+/// can flash, but its product and version say nothing about the phone.
+/// A product naming another real model is not rescue: that is a wrong
+/// `--device`.
+pub fn is_rescue_bootloader(product: Option<&str>, bootloader: Option<&str>) -> bool {
+    bootloader.is_some_and(|b| b.starts_with("cloudripper-"))
+        || product.is_some_and(|p| RESCUE_PRODUCTS.contains(&p))
+}
+
+/// The pieces of a local factory image (ZIP or unpacked directory).
+fn local_parts(path: &Path) -> Result<Parts> {
+    if path.is_dir() {
+        // Accept the unzip root too (`<device>-<build>-factory-<sha>/<device>-<build>/`).
+        let dir = if find_file(path, "bootloader-", ".img").is_some() {
+            path.to_path_buf()
+        } else {
+            std::fs::read_dir(path)?
+                .flatten()
+                .map(|e| e.path())
+                .find(|p| p.is_dir() && find_file(p, "bootloader-", ".img").is_some())
+                .with_context(|| format!("no bootloader-*.img in {}", path.display()))?
+        };
+        let parts = Parts {
+            bootloader: find_file(&dir, "bootloader-", ".img"),
+            radio: find_file(&dir, "radio-", ".img"),
+            image: find_file(&dir, "image-", ".zip"),
+            flash_all: find_file(&dir, "flash-all.sh", ""),
+        };
+        ensure!(
+            parts.bootloader.is_some() && parts.image.is_some(),
+            "{} has no bootloader-*.img or image-*.zip; is it a factory image?",
+            dir.display()
+        );
+        Ok(parts)
+    } else {
+        extract_parts(path, &path.with_extension(""))
+    }
+}
+
+/// Check a local factory image is for `device`: the bootloader's file name
+/// carries the codename and its FBPK header the SoC.
+fn check_local(parts: &Parts, device: &str) -> Result<String> {
+    let bl = parts.bootloader.as_ref().unwrap();
+    let version = bootloader_version(bl, device).with_context(|| {
+        format!(
+            "{} is not a {device} bootloader",
+            bl.file_name().unwrap_or_default().to_string_lossy()
+        )
+    })?;
+    if let Some(model) = crate::devices::model(device) {
+        let pack = crate::fbpk::load(bl)?;
+        ensure!(
+            pack.platform == model.soc.name,
+            "{} is built for {}, but the {} is {}",
+            bl.display(),
+            pack.platform,
+            model.name,
+            model.soc.name
+        );
+        let bad: Vec<_> = pack
+            .data_entries()
+            .filter(|e| !pack.verify_crc(e))
+            .map(|e| e.name.clone())
+            .collect();
+        ensure!(
+            bad.is_empty(),
+            "CRC mismatch in {}; the image is corrupt",
+            bad.join(", ")
+        );
+    }
+    Ok(version)
 }
 
 pub fn images_root() -> PathBuf {
@@ -383,6 +468,29 @@ fn wait_for_fastboot(serial: &str, secs: u64) -> Result<()> {
     bail!("{serial} did not come back to fastboot within {secs} s")
 }
 
+/// Wait for the phone to come back after leaving a rescue bootloader: under
+/// `serial`, or as the only phone in fastboot.
+fn wait_for_rescued(serial: &str, secs: u64) -> Result<String> {
+    std::thread::sleep(Duration::from_secs(2));
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(secs) {
+        let now = fastboot_serials()?;
+        if now.iter().any(|s| s == serial) {
+            return Ok(serial.to_string());
+        }
+        if let [one] = now.as_slice() {
+            println!("the phone came back as {one}");
+            return Ok(one.clone());
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    bail!(
+        "the phone did not come back to fastboot within {secs} s. If it is in Pixel ROM \
+         Recovery again, its storage bootloader did not boot: run `pixel-restore boot` again \
+         and try a newer build"
+    )
+}
+
 /// Anti-rollback counters the bootloader reports: application processor
 /// (non-secure, secure) and GSA (BL1, firmware). A flashed bootloader that
 /// raises one has crossed a rollback bump.
@@ -509,12 +617,40 @@ fn pick_phone(wanted: Option<&str>) -> Result<Option<Phone>> {
 /// The standard flash-all sequence, checking each step took. The inactive
 /// slot gets the same bootloader and radio last: one left below the
 /// rollback level bricks the phone if it ever falls back to that slot.
-fn install(phone: &Phone, parts: &Parts, want_bootloader: &str, wipe: bool) -> Result<()> {
-    let s = &phone.serial;
+fn install(
+    phone: &Phone,
+    parts: &Parts,
+    want_bootloader: &str,
+    wipe: bool,
+    rescue: bool,
+) -> Result<()> {
+    let mut serial = phone.serial.clone();
+    let s = serial.as_str();
     let path = |p: &Option<PathBuf>| p.as_ref().unwrap().to_string_lossy().into_owned();
     fastboot(s, &["flash", "bootloader", &path(&parts.bootloader)])?;
+    if rescue {
+        // The bootloader running now is in RAM and storage may hold a broken
+        // one in either slot; give both a good copy before the reboot, so
+        // the ROM finds one whichever slot it tries.
+        fastboot(
+            s,
+            &[
+                "--slot=other",
+                "flash",
+                "bootloader",
+                &path(&parts.bootloader),
+            ],
+        )?;
+    }
     fastboot(s, &["reboot-bootloader"])?;
-    wait_for_fastboot(s, 90)?;
+    if rescue {
+        // The phone's own bootloader may present a different serial than
+        // the rescue one did.
+        serial = wait_for_rescued(s, 90)?;
+    } else {
+        wait_for_fastboot(s, 90)?;
+    }
+    let s = serial.as_str();
     let now = getvar(s, "version-bootloader");
     ensure!(
         now.as_deref() == Some(want_bootloader),
@@ -522,10 +658,16 @@ fn install(phone: &Phone, parts: &Parts, want_bootloader: &str, wipe: bool) -> R
         now.as_deref().unwrap_or("nothing")
     );
     let after = read_counters(s);
-    if let Some(prod) = &phone.product {
+    let product = getvar(s, "product");
+    if let Some(prod) = &product {
         record_counters(prod, want_bootloader, &after);
     }
-    let up = raised(&phone.counters, &after);
+    // A rescue bootloader's counters are not the phone's own.
+    let up = if rescue {
+        vec![]
+    } else {
+        raised(&phone.counters, &after)
+    };
     if !up.is_empty() {
         println!(
             "WARNING: bootloader {want_bootloader} raised anti-rollback counters ({}); \
@@ -561,13 +703,30 @@ fn install(phone: &Phone, parts: &Parts, want_bootloader: &str, wipe: bool) -> R
 
 pub fn run(a: RestoreArgs) -> Result<()> {
     let phone = pick_phone(a.serial.as_deref())?;
-    let device = match (&a.device, &phone) {
-        (Some(d), _) => fetch::codename(d)?,
-        (None, Some(p)) => p
+    let rescue = phone
+        .as_ref()
+        .is_some_and(|p| is_rescue_bootloader(p.product.as_deref(), p.bootloader.as_deref()));
+    let local = a.image.as_deref().map(local_parts).transpose()?;
+    let local_device = local
+        .as_ref()
+        .and_then(|l| l.bootloader.as_ref())
+        .and_then(|b| b.file_name()?.to_str())
+        .and_then(|n| n.strip_prefix("bootloader-")?.split('-').next())
+        .map(String::from);
+    let device = match (&a.device, &local_device, &phone) {
+        (Some(d), _, _) => fetch::codename(d)?,
+        (None, Some(d), _) => d.clone(),
+        (None, None, Some(p)) if rescue => bail!(
+            "the phone is running a recovery-pack bootloader from RAM (product {}, bootloader \
+             {}), which does not know which model it is on; pass --device",
+            p.product.as_deref().unwrap_or("?"),
+            p.bootloader.as_deref().unwrap_or("?")
+        ),
+        (None, None, Some(p)) => p
             .product
             .clone()
             .context("the phone did not report its product; pass --device")?,
-        (None, None) => bail!(
+        (None, None, None) => bail!(
             "no phone in fastboot; connect one, or pass --device and --build to just download"
         ),
     };
@@ -584,11 +743,19 @@ pub fn run(a: RestoreArgs) -> Result<()> {
             if !p.counters.is_empty() {
                 println!("anti-rollback counters: {}", format_counters(&p.counters));
             }
-            if let (Some(prod), Some(bl)) = (&p.product, &p.bootloader) {
-                record_counters(prod, bl, &p.counters);
-            }
-            if let Some(prod) = &p.product {
-                ensure!(*prod == device, "the phone is {prod}, not {device}");
+            if rescue {
+                println!(
+                    "this is a recovery-pack bootloader running from RAM, not the {device}'s own; \
+                     its product, version and counters say nothing about the phone, so the \
+                     rollback floor cannot be read. The bootloader goes to both slots."
+                );
+            } else {
+                if let (Some(prod), Some(bl)) = (&p.product, &p.bootloader) {
+                    record_counters(prod, bl, &p.counters);
+                }
+                if let Some(prod) = &p.product {
+                    ensure!(*prod == device, "the phone is {prod}, not {device}");
+                }
             }
             ensure!(
                 !p.userspace,
@@ -601,9 +768,58 @@ pub fn run(a: RestoreArgs) -> Result<()> {
             );
         }
         None => ensure!(
-            !a.apply && a.build.is_some(),
-            "no phone in fastboot; only `--device X --build B` without --apply works without one"
+            !a.apply && (a.build.is_some() || local.is_some()),
+            "no phone in fastboot; only `--device X --build B` (or --image) without --apply \
+             works without one"
         ),
+    }
+
+    if let Some(parts) = &local {
+        let version = check_local(parts, &device)?;
+        println!(
+            "local factory image for {device}, bootloader {version}: {}",
+            a.image.as_ref().unwrap().display()
+        );
+        if let Some(p) = phone.as_ref().filter(|_| !rescue) {
+            if let Some(bl) = &p.bootloader {
+                ensure!(
+                    version_key(&version) >= version_key(bl) || a.cross_rollback_bump,
+                    "bootloader {version} is older than the phone's {bl}; it would not boot \
+                     (--cross-rollback-bump to flash anyway)"
+                );
+            }
+        }
+        if let Some(script) = &parts.flash_all {
+            for step in unusual_flash_steps(&std::fs::read_to_string(script)?) {
+                println!(
+                    "note: this build's flash-all.sh also runs `{step}`, which restore does not"
+                );
+            }
+        }
+        let Some(phone) = &phone else {
+            println!("no phone in fastboot; nothing flashed");
+            return Ok(());
+        };
+        if !a.apply {
+            print_plan(parts, a.wipe, rescue);
+            return Ok(());
+        }
+        install(phone, parts, &version, a.wipe, rescue)?;
+        println!(
+            "\n{} installed {version}; the phone is rebooting into Android.",
+            phone.serial
+        );
+        return Ok(());
+    }
+
+    if rescue {
+        ensure!(
+            a.build.is_some(),
+            "a recovery-pack bootloader cannot report the phone's rollback level, so pick the \
+             build yourself: --build <the build the {device} last ran, or newer>, or \
+             --image <factory.zip>. Older than what it last ran will not boot; newer may raise \
+             the rollback level for good."
+        );
     }
 
     let (images, html) = list_images(&device, a.refresh)?;
@@ -618,7 +834,7 @@ pub fn run(a: RestoreArgs) -> Result<()> {
     // when only "no older bootloader than now" is known to be safe.
     let mut checked: Option<HashMap<String, String>> = None;
     let mut phone_bl = String::new();
-    if let Some(p) = &phone {
+    if let Some(p) = phone.as_ref().filter(|_| !rescue) {
         phone_bl = p.bootloader.clone().context(
             "the phone did not report version-bootloader, so its rollback level is unknown",
         )?;
@@ -670,7 +886,7 @@ pub fn run(a: RestoreArgs) -> Result<()> {
         let bl = cached_bootloader(image)?;
         let version = bootloader_version(&bl, &device)
             .with_context(|| format!("cannot read a version from {}", bl.display()))?;
-        if let Some(p) = &phone {
+        if let Some(p) = phone.as_ref().filter(|_| !rescue) {
             let p_counters = &p.counters;
             let refusal = match &checked {
                 Some(map) => {
@@ -727,18 +943,10 @@ pub fn run(a: RestoreArgs) -> Result<()> {
             return Ok(());
         };
         if !a.apply {
-            println!(
-                "would flash bootloader, radio, then `fastboot {}update` from {}",
-                if a.wipe { "-w " } else { "" },
-                build_dir(image).display()
-            );
-            if !a.wipe {
-                println!("(add --wipe if this is older than the Android the phone last ran)");
-            }
-            println!("dry run; pass --apply to flash");
+            print_plan(&parts, a.wipe, rescue);
             return Ok(());
         }
-        match install(phone, &parts, &version, a.wipe) {
+        match install(phone, &parts, &version, a.wipe, rescue) {
             Ok(()) => {
                 println!(
                     "\n{} installed {}; the phone is rebooting into Android.",
@@ -760,6 +968,29 @@ pub fn run(a: RestoreArgs) -> Result<()> {
         }
     }
     bail!("no build for {device} installed")
+}
+
+fn print_plan(parts: &Parts, wipe: bool, rescue: bool) {
+    let dir = parts
+        .bootloader
+        .as_ref()
+        .and_then(|b| b.parent())
+        .map(|d| d.display().to_string())
+        .unwrap_or_default();
+    println!(
+        "would flash bootloader{}{}, then `fastboot {}update` from {dir}",
+        if rescue { " to both slots" } else { "" },
+        if parts.radio.is_some() {
+            ", radio"
+        } else {
+            " (no radio in this image)"
+        },
+        if wipe { "-w " } else { "" },
+    );
+    if !wipe {
+        println!("(add --wipe if this is older than the Android the phone last ran)");
+    }
+    println!("dry run; pass --apply to flash");
 }
 
 #[cfg(test)]
@@ -799,6 +1030,57 @@ mod tests {
         let pinned = candidates(&images, Some("AP3A.241005.015"), false);
         assert_eq!(pinned[0].build, "ap3a.241005.015");
         assert!(candidates(&images, Some("nope"), false).is_empty());
+    }
+
+    #[test]
+    fn rescue_bootloaders_are_recognised() {
+        // gs201 pack ABL on a Pixel Tablet / 7a / Fold.
+        assert!(is_rescue_bootloader(
+            Some("cloudripper"),
+            Some("cloudripper-1.0-8910487")
+        ));
+        assert!(is_rescue_bootloader(None, Some("cloudripper-1.0-8910487")));
+        // husky ABL on an akita.
+        assert!(is_rescue_bootloader(
+            Some("unknown"),
+            Some("ripcurrent-14.0-10600542")
+        ));
+        // The phone's own bootloader, or a different real model: not rescue.
+        assert!(!is_rescue_bootloader(
+            Some("tangorpro"),
+            Some("tangorpro-15.2-13237001")
+        ));
+        assert!(!is_rescue_bootloader(Some("panther"), Some("cloudripper-x").and(None)));
+    }
+
+    #[test]
+    fn local_factory_directory_is_found_and_checked() {
+        let root = std::env::temp_dir().join(format!("pr-local-{}", std::process::id()));
+        let dir = root.join("tangorpro-bp1a.250405.007");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bl = dir.join("bootloader-tangorpro-tangorpro-15.2-13237001.img");
+        let mut abl = vec![0u8; 4096];
+        abl[0x400..0x404].copy_from_slice(b"ABL\0");
+        let img = crate::fbpk::tests::build(&[(
+            "abl",
+            crate::fbpk::ENTRY_PARTITION_DATA,
+            true,
+            &abl,
+        )]);
+        std::fs::write(&bl, &img).unwrap();
+        std::fs::write(dir.join("image-tangorpro-bp1a.250405.007.zip"), b"").unwrap();
+        // The unzip root works as well as the inner directory.
+        let parts = local_parts(&root).unwrap();
+        assert!(parts.radio.is_none(), "tablets have no radio image");
+        assert_eq!(parts.bootloader.as_deref(), Some(bl.as_path()));
+        // The test FBPK says zumapro, which is not the tablet's gs201.
+        let err = check_local(&parts, "tangorpro").unwrap_err().to_string();
+        assert!(err.contains("built for zumapro"), "{err}");
+        assert!(check_local(&parts, "husky")
+            .unwrap_err()
+            .to_string()
+            .contains("not a husky bootloader"));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

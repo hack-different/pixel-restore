@@ -871,6 +871,16 @@ fn boot(args: BootArgs) -> Result<()> {
         Some(list) => println!("fastboot sees: {list}"),
         None => println!("(fastboot does not see it yet, or is not installed)"),
     }
+    // The rescue bootloader may not know which model it is on (the gs201
+    // pack's ABL is the cloudripper dev-board build), so name the model.
+    if let Some(m) = model {
+        println!(
+            "Flash the {}'s own bootloader (both slots) and Android with:\n\
+             \n  pixel-restore restore --device {} --image <{}-*-factory-*.zip or its folder> --apply\n  \
+             pixel-restore restore --device {} --build <build it last ran> --apply   # download instead\n",
+            m.name, m.codename, m.codename, m.codename
+        );
+    }
     let fetch_hint = match model.or(pack_model) {
         Some(m) => format!("pixel-restore fetch {} --full", m.codename),
         None => "pixel-restore fetch <codename> --full".to_string(),

@@ -113,8 +113,13 @@ pub const MODELS: &[Model] = &[
     m("oriole", "Pixel 6", GS101, None, NoBl1),
     m("raven", "Pixel 6 Pro", GS101, None, NoBl1),
     m("bluejay", "Pixel 6a", GS101, None, NoBl1),
-    // The gs201 pack's ABL is "cloudripper", the bootloader panther and
-    // cheetah share. lynx, felix and tangorpro have bootloaders of their own.
+    // The gs201 pack's ABL is "cloudripper-1.0", Google's gs201 dev-board
+    // bootloader, not a retail one: it is not tied to a product, which is
+    // why it is the best bet for lynx, felix and tangorpro too. Under it
+    // fastboot reports product cloudripper/unknown, so `restore` treats it
+    // as a rescue bootloader and needs --device. Retail gs201 images (e.g.
+    // tangorpro-15.2) have the USB-boot bit clear (flags 0x400) and the ROM
+    // refuses them, so the pack serves every stage.
     m("panther", "Pixel 7", GS201, Some("gs201"), Pack),
     m("cheetah", "Pixel 7 Pro", GS201, Some("gs201"), Pack),
     m("lynx", "Pixel 7a", GS201, Some("gs201"), SiblingPack),
