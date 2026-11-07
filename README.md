@@ -62,7 +62,7 @@ in that ZIP is executed. `pixel-restore models` prints this table.
 | Pixel 8 Pro | husky | zuma (G3) | **verified** before the anti-rollback bump; refused once on ripcurrent-17.0 |
 | Pixel 7, 7 Pro | panther, cheetah | gs201 (G2) | recovery pack (`cloudripper` ABL) |
 | Pixel 8a | akita | zuma (G3) | husky pack, untested: BL1 key matches, ABL is husky's |
-| Pixel 7a, Fold, Tablet | lynx, felix, tangorpro | gs201 (G2) | gs201 pack, untested: ABL is panther/cheetah's |
+| Pixel 7a, Fold, Tablet | lynx, felix, tangorpro | gs201 (G2) | gs201 pack, untested: its ABL is the product-neutral `cloudripper` dev-board build; see [Pixel Tablet](#pixel-tablet-tangorpro) |
 | Pixel 6, 6 Pro, 6a | oriole, raven, bluejay | gs101 (G1) | no USB-bootable BL1 published |
 | Pixel 9 family, 9a | tokay, caiman, komodo, comet, tegu | zumapro (G4) | no USB-bootable BL1 published |
 | Pixel 10 family | frankel, blazer, mustang, rango | laguna (G5) | no USB-bootable BL1 published; ROM protocol unknown |
@@ -122,6 +122,31 @@ and the ROM will answer `bl1 header fail`.
 
    Don't reboot or let the battery die before the bootloader flash: the phone
    goes straight back to ROM recovery.
+
+### Pixel Tablet (tangorpro)
+
+The tablet is gs201, so the gs201 pack gets it out of ROM recovery. Its
+retail stages (`tangorpro-15.2` and later) have the USB-boot bit clear and
+the ROM refuses them, so the pack serves every stage, ABL included. That
+ABL is Google's `cloudripper` dev-board bootloader: fastboot works, but it
+reports product `cloudripper` or `unknown` and its own version and
+anti-rollback counters, none of which describe the tablet. `restore`
+recognises it as a rescue bootloader, so name the model and the image:
+
+```sh
+pixel-restore boot --device tangorpro --wait
+pixel-restore restore --device tangorpro --image tangorpro-<build>-factory-<sha>.zip           # dry run
+pixel-restore restore --device tangorpro --image tangorpro-<build>-factory-<sha>.zip --apply   # keeps data
+```
+
+`--image` takes the factory ZIP or the folder it unzips to. In rescue mode
+`restore` writes the bootloader to both slots before rebooting (the
+broken one could be in either), checks the tablet comes back on
+`tangorpro-*`, then runs `fastboot update`. The tablet has no radio image.
+The rescue bootloader cannot report the rollback floor, so pick a build no
+older than the one the tablet last ran (older will not boot and lands back
+in ROM recovery; rerun `boot`). Add `--wipe` if Android does not come up
+after a downgrade. A locked bootloader refuses to flash either way.
 
 ### Factory images
 

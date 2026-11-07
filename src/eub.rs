@@ -237,8 +237,9 @@ pub fn probe(port: &mut dyn Link, timeout: Duration) -> Result<Option<String>> {
         }
         if !nudged && !heard && opened.elapsed() > NUDGE_AFTER {
             nudged = true;
+            // No flush: draining waits for the device to read the byte, and
+            // a wedged ROM never does, which would hang past every timeout.
             port.write_all(b"\n").ok();
-            port.flush().ok();
         }
     }
     Ok(None)
@@ -275,7 +276,6 @@ pub fn boot(
     if opts.send_stop {
         println!("sending DNW STOP");
         port.write_all(&dnw::stop_frame())?;
-        port.flush().ok();
     }
 
     loop {
@@ -298,8 +298,8 @@ pub fn boot(
 
         if !nudged && !heard && opened.elapsed() > NUDGE_AFTER {
             nudged = true;
+            // No flush, as in `probe`: a wedged ROM never drains it.
             port.write_all(b"\n").context("nudging the ROM")?;
-            port.flush().ok();
         }
 
         let quiet = last_activity.elapsed();
@@ -315,7 +315,9 @@ pub fn boot(
                 .to_string();
             bail!(
                 "no message from the ROM for {:?} (pending request: {:?}, unparsed bytes: \"{}\"). \
-                 Is the phone still in ROM-recovery mode?",
+                 Is the phone still in ROM-recovery mode? A ROM left waiting too long stops \
+                 answering: unplug it, hold Power + Volume Up + Volume Down, plug it back in \
+                 and run this again with --wait.",
                 opts.idle_timeout,
                 pending,
                 partial
